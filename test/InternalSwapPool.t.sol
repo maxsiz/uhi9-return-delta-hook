@@ -70,7 +70,7 @@ contract TestInternalSwapPool is Test, Deployers, hlpEnvelopTest {
             abi.encode(manager, address(0)),           // constructor args
             hookAddress                                // address of deployed contract
         );
-        hook = InternalSwapPool(hookAddress);
+        hook = InternalSwapPool(payable(hookAddress));
           
         // Initialize a pool 
         (key, ) = initPool(
@@ -129,11 +129,77 @@ contract TestInternalSwapPool is Test, Deployers, hlpEnvelopTest {
         );
         swapRouter.swap{value: 0.1 ether}(key, params, testSettings, ZERO_BYTES);
         console2.log(
-            "After swap Addres(manager).ethBalance:%s, \n raw: %s ", 
+            "After swap Addres(manager).ethBalance:%s, \n raw: %s ",
             _formatEther(address(manager).balance), address(manager).balance
         );
-        //assertEq(0, 0 gwei);
-       
+
+        // zeroForOne + exact-in: unspecified = currency1, fee accumulates in amount1.
+        // 1% of ~9.999e15 token1 ≈ 9.999e13 < DONATE_THRESHOLD_MIN (1e14) → no donate.
+        InternalSwapPool.ClaimableFees memory fees = hook.poolFees(key);
+        assertEq(fees.amount0, 0, "fees should not land in amount0");
+        assertGt(fees.amount1, 0, "fees should accumulate in amount1");
+    }
+
+    function test_oneForZero_exactIn() public {
+        // Selling token1 for ETH, exact input.
+        // Unspecified = currency0 (ETH), fee accumulates in amount0, below threshold → no donate.
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
+            .TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: false,
+            amountSpecified: -0.01 ether,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        uint managerEthBefore = address(manager).balance;
+        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+
+        // User paid token1, received ETH from the pool. Manager loses ETH on net.
+        assertLt(address(manager).balance, managerEthBefore, "manager ETH must decrease");
+
+        InternalSwapPool.ClaimableFees memory fees = hook.poolFees(key);
+        assertGt(fees.amount0, 0, "fees should accumulate in amount0 (ETH)");
+        assertEq(fees.amount1, 0, "fees should not land in amount1");
+    }
+
+    function test_zeroForOne_exactOut() public {
+        // Buying 0.01 token1 with ETH, exact output.
+        // Unspecified = currency0 (ETH input). Fee = ~1% of input > threshold → donate triggers.
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
+            .TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 0.01 ether,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        swapRouter.swap{value: 0.1 ether}(key, params, testSettings, ZERO_BYTES);
+
+        // donate path drained the bucket back to zero.
+        InternalSwapPool.ClaimableFees memory fees = hook.poolFees(key);
+        assertEq(fees.amount0, 0, "amount0 should be zero after donate");
+        assertEq(fees.amount1, 0, "amount1 should remain zero");
+    }
+
+    function test_oneForZero_exactOut() public {
+        // Buying 0.01 ETH with token1, exact output.
+        // Unspecified = currency1 (token1 input). Fee > threshold → donate triggers on currency1.
+        PoolSwapTest.TestSettings memory testSettings = PoolSwapTest
+            .TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: false,
+            amountSpecified: 0.01 ether,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+
+        InternalSwapPool.ClaimableFees memory fees = hook.poolFees(key);
+        assertEq(fees.amount0, 0, "amount0 should remain zero");
+        assertEq(fees.amount1, 0, "amount1 should be zero after donate");
     }
 
 }

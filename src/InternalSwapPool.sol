@@ -69,6 +69,11 @@ contract InternalSwapPool is BaseHook {
     constructor (address _poolManager, address _nativeToken) BaseHook(IPoolManager(_poolManager)) {
         nativeToken = _nativeToken;
     }
+
+    /// @dev Required so that PoolManager.take(currency0=ETH, ...) and donate refunds can
+    /// transfer native ETH into this hook (e.g. fee collection on the unspecified side
+    /// when currency0 is ETH).
+    receive() external payable {}
  
     /**
      * Provides the {ClaimableFees} for a pool.
