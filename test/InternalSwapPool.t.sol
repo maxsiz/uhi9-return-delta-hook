@@ -82,6 +82,7 @@ contract TestInternalSwapPool is Test, Deployers, hlpEnvelopTest {
         );
         
         vm.deal(address(this), 100 ether);
+        vm.deal(hookAddress, 100 ether);  // !!!!
         console2.log(
             "Addres(this).ethBalance:%s, \n raw: %s ", 
             _formatEther(address(this).balance), address(this).balance
@@ -101,6 +102,10 @@ contract TestInternalSwapPool is Test, Deployers, hlpEnvelopTest {
             "Addres(this).ethBalance:%s, \n raw: %s ", 
             _formatEther(address(this).balance), address(this).balance
         );
+        console2.log(
+            "Addres(this).currency1:%s, \n raw: %s ", 
+            _formatEther(currency1.balanceOf(address(this))), currency1.balanceOf(address(this))
+        );
         assertGt(address(manager).balance, 8 ether);
 	}
 
@@ -117,6 +122,10 @@ contract TestInternalSwapPool is Test, Deployers, hlpEnvelopTest {
         console2.log(
             "Before swap Addres(manager).ethBalance:%s, \n raw: %s ", 
             _formatEther(address(manager).balance), address(manager).balance
+        );
+        console2.log(
+            "Before swap Addres(manager).currency1:%s, \n raw: %s ", 
+            _formatEther(currency1.balanceOf(address(manager))), currency1.balanceOf(address(manager))
         );
         swapRouter.swap{value: 0.1 ether}(key, params, testSettings, ZERO_BYTES);
         console2.log(
