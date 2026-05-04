@@ -267,23 +267,25 @@ contract InternalSwapPool is BaseHook {
             ? delta.amount1() 
             : delta.amount0();
      
-        // Calculate the swap fee and ensure it is a positive uint
-        uint swapFee = uint(uint128(swapAmount < 0 ? -swapAmount : swapAmount)) * 99 / 100;
-     
-        // Calculate a percentage of the swap amount to capture as the fee. For this hook example we
-        // will take 1% of the value that would be received.
-        // ????
+        // Calculate the swap fee and ensure it is a positive uint.
+        // 1% of the unspecified-side swap amount.
+        uint swapFee = uint(uint128(swapAmount < 0 ? -swapAmount : swapAmount)) / 100;
+
+        // Fee is taken from the unspecified currency, so the bucket follows that side.
+        bool feeInCurrency1 = (params.amountSpecified < 0) == params.zeroForOne;
         depositFees(
             key,
-            params.zeroForOne ? swapFee : 0,
-            params.zeroForOne ? 0 : swapFee
+            feeInCurrency1 ? 0 : swapFee,
+            feeInCurrency1 ? swapFee : 0
         );
-     
+
         // Take our swap fees from the {PoolManager}
         swapFeeCurrency.take(poolManager, address(this), swapFee, false);
-     
-        // Set our hookDelta to remove the amount of fees from the amount that the user will receive
-        hookDeltaUnspecified_ = -int128(int(swapFee));
+
+        // Positive return on the unspecified axis: PoolManager will subtract this from the
+        // user's swapDelta and credit the hook's account by the same amount, balancing the
+        // debit created by the take() above.
+        hookDeltaUnspecified_ = int128(int(swapFee));
      
         // Distribute fees to our LPs
         _distributeFees(key);
@@ -300,27 +302,30 @@ contract InternalSwapPool is BaseHook {
      * @param _poolKey The PoolKey reference that will have fees distributed
      */
     function _distributeFees(PoolKey calldata _poolKey) internal {
-         // Get the amount of the native token available to donate
         PoolId poolId = _poolKey.toId();
-        uint donateAmount = _poolFees[poolId].amount0;
-     
-        // Ensure that the collection has sufficient fees available
-        if (donateAmount < DONATE_THRESHOLD_MIN) {
+        uint donateAmount0 = _poolFees[poolId].amount0;
+        uint donateAmount1 = _poolFees[poolId].amount1;
+
+        // Apply the threshold per side. A side below the threshold is left for next time.
+        if (donateAmount0 < DONATE_THRESHOLD_MIN) donateAmount0 = 0;
+        if (donateAmount1 < DONATE_THRESHOLD_MIN) donateAmount1 = 0;
+
+        if (donateAmount0 == 0 && donateAmount1 == 0) {
             return;
         }
-        
-        // Make our donation to the pool
-        BalanceDelta delta = poolManager.donate(_poolKey, donateAmount, 0, '');
-     
-        // @todo We need to settle tokens here
-        // Check the native delta amounts that we need to transfer from the contract
+
+        BalanceDelta delta = poolManager.donate(_poolKey, donateAmount0, donateAmount1, '');
+
+        // donate() debits the donor (this hook) on each side; settle real tokens to clear it.
         if (delta.amount0() < 0) {
             _poolKey.currency0.settle(poolManager, address(this), uint(uint128(-delta.amount0())), false);
         }
-     
-        // Reduce our available fees
-        _poolFees[poolId].amount0 -= donateAmount;
-        //
+        if (delta.amount1() < 0) {
+            _poolKey.currency1.settle(poolManager, address(this), uint(uint128(-delta.amount1())), false);
+        }
+
+        _poolFees[poolId].amount0 -= donateAmount0;
+        _poolFees[poolId].amount1 -= donateAmount1;
     }
  
     /**
