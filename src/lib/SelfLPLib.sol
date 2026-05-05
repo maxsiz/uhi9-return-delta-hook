@@ -30,13 +30,17 @@ library SelfLPLib {
         pure
         returns (int24 tickLower, int24 tickUpper)
     {
+        // Floor division: for negative numbers, integer division truncates toward zero, but we need floor.
         int24 compressed = currentTick / tickSpacing;
         if (currentTick < 0 && currentTick % tickSpacing != 0) compressed--;
+        // Center = spacing-aligned tick at or below currentTick.
         int24 center = compressed * tickSpacing;
 
+        // Round half-width down to nearest spacing multiple; enforce minimum = tickSpacing (avoid 0 range).
         int24 halfSnapped = (halfWidthTicks / tickSpacing) * tickSpacing;
         if (halfSnapped < tickSpacing) halfSnapped = tickSpacing;
 
+        // Symmetric range around center: [center - halfSnapped, center + halfSnapped].
         tickLower = center - halfSnapped;
         tickUpper = center + halfSnapped;
     }
@@ -65,11 +69,13 @@ library SelfLPLib {
         if (fees0 == 0 && fees1 == 0) return 0;
 
         if (p.ethIsCurrency0) {
-            // currency1 → ETH: amount1 * Q192 / sqrtPriceX96^2 (split into two mulDivs).
+            // currency1 → ETH via price: amount1 * sqrtPrice^2 / Q192.
+            // Split into two mulDivs to avoid overflow: (fees1 * Q96 / sqrtPrice) * Q96 / sqrtPrice.
             uint256 step = FullMath.mulDiv(fees1, FixedPoint96.Q96, p.sqrtPriceX96);
             ethValue = fees0 + FullMath.mulDiv(step, FixedPoint96.Q96, p.sqrtPriceX96);
         } else {
-            // currency0 → ETH: amount0 * sqrtPriceX96^2 / Q192.
+            // currency0 → ETH via price: amount0 * sqrtPrice^2 / Q192.
+            // Split into two mulDivs: (fees0 * sqrtPrice / Q96) * sqrtPrice / Q96.
             uint256 step = FullMath.mulDiv(fees0, p.sqrtPriceX96, FixedPoint96.Q96);
             ethValue = fees1 + FullMath.mulDiv(step, p.sqrtPriceX96, FixedPoint96.Q96);
         }
@@ -82,6 +88,7 @@ library SelfLPLib {
 
         (uint256 fgi0Now, uint256 fgi1Now) = p.manager.getFeeGrowthInside(p.poolId, p.tickLower, p.tickUpper);
         unchecked {
+            // Fee = (feeGrowthInside_now - feeGrowthInside_last) * liquidity / Q128.
             // Subtraction wraps on overflow per V4 invariants; same convention as Position.update.
             fees0 = FullMath.mulDiv(fgi0Now - fgi0Last, liquidity, FixedPoint128.Q128);
             fees1 = FullMath.mulDiv(fgi1Now - fgi1Last, liquidity, FixedPoint128.Q128);
@@ -105,19 +112,20 @@ library SelfLPLib {
         uint160 sqrtA = TickMath.getSqrtPriceAtTick(newTickLower);
         uint160 sqrtB = TickMath.getSqrtPriceAtTick(newTickUpper);
 
-        // Max liquidity supported by current balances at the new range.
+        // Inverse liquidity formula: L = min(balance0 * sqrt(price) / (sqrt(B) - sqrt(price)), ...).
         uint128 maxLiq = LiquidityAmounts.getLiquidityForAmounts(sqrtPriceX96, sqrtA, sqrtB, balance0, balance1);
         if (maxLiq == 0) return (false, 0);
 
+        // Forward liquidity formula: amounts = (L * (sqrt(B) - sqrt(price)) / (sqrt(B) - sqrt(A)), ...).
         (uint256 target0, uint256 target1) = LiquidityAmounts.getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, maxLiq);
 
-        // Whichever side has surplus over the target is the side to swap out of.
+        // Identify which side has surplus and swap half of it (heuristic: avoids overshoot and iteration).
         if (balance0 > target0 && target1 > balance1) {
             // Surplus in 0, deficit in 1 → sell 0 for 1.
-            // Naive split: swap half of the surplus. Iterating to convergence is overkill for a demo.
             return (true, (balance0 - target0) / 2);
         }
         if (balance1 > target1 && target0 > balance0) {
+            // Surplus in 1, deficit in 0 → sell 1 for 0.
             return (false, (balance1 - target1) / 2);
         }
         return (false, 0);
