@@ -113,8 +113,8 @@ Stateless helpers (внутренняя library), переиспользуетс
 
 ## Implementation order
 
-1. **`src/lib/SelfLPLib.sol`** — pure helpers, юнит-тестим первыми.
-2. **`src/SelfLPDirect.sol`** + `test/SelfLPDirect.t.sol` — baseline: deploy → seed → swap (no-op) → swap (reinvest).
+1. ✅ **`src/lib/SelfLPLib.sol`** — COMPLETED. Pure helpers: `computeRange`, `previewFeesETH`, `computeReinvestSwap`.
+2. ✅ **`src/SelfLPDirect.sol`** + `test/SelfLPDirect.t.sol` — COMPLETED. Baseline: `seedPosition`, `_beforeInitialize` (dynamic fee + ETH guard), `_afterInitialize` (updateDynamicLPFee), `_afterSwap` (view-side threshold + flash-accounting reinvest). All 8 tests passing; `forge build --sizes` succeeds.
 3. **`src/SelfLPAfterDelta.sol`** + тесты — skim buffer + return-delta.
 4. **`src/SelfLPBeforeInternalize.sol`** + тесты — internalize + before-delta.
 
