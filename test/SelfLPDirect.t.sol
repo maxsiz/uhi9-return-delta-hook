@@ -15,6 +15,7 @@ import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
 import {SwapParams, ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 
 import {SelfLPDirect} from "../src/SelfLPDirect.sol";
 import {hlpEnvelopTest} from "./hlpEnvelopTest.sol";
@@ -22,6 +23,7 @@ import {hlpEnvelopTest} from "./hlpEnvelopTest.sol";
 contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     SelfLPDirect hook;
     Currency ethCurrency = Currency.wrap(address(0));
@@ -29,6 +31,27 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     int24 constant HALF_WIDTH = 600;
     uint256 constant FEE_THRESHOLD_ETH = 1e13; // 0.00001 ETH — small enough that one 0.01 ETH swap crosses it
     uint24 constant LP_FEE = 3000; // 0.30%
+
+    function _logHookState(string memory title) internal view {
+        (uint160 sqrtPrice, int24 tickCurrent,,) = manager.getSlot0(key.toId());
+        console2.log("");
+        console2.log(string.concat("=== ", title, " ==="));
+        console2.log(string.concat("ETH:     ", _formatEther(address(hook).balance), " ether"));
+        console2.log(string.concat("Token1:  ", vm.toString(currency1.balanceOf(address(hook)))));
+
+        int24 center = (hook.currentTickLower() + hook.currentTickUpper()) / 2;
+        console2.log(string.concat("Tick:    ", _formatTick(center), " (current ", _formatTick(tickCurrent), ")"));
+        console2.log(string.concat("Range:   [", _formatTick(hook.currentTickLower()), ", ", _formatTick(hook.currentTickUpper()), "]"));
+        console2.log(string.concat("Liq:     ", vm.toString(uint256(hook.currentLiquidity()))));
+        console2.log(string.concat("sqrtP:   ", vm.toString(uint256(sqrtPrice))));
+    }
+
+    function _formatTick(int24 tick) internal pure returns (string memory) {
+        if (tick < 0) {
+            return string.concat("-", vm.toString(uint256(int256(-tick))));
+        }
+        return vm.toString(uint256(int256(tick)));
+    }
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -93,7 +116,16 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     // ----------------------------------------------------------------------- //
 
     function test_seedPosition_initialState() public {
+        console2.log("");
+        console2.log("=== test_seedPosition_initialState ===");
+        console2.log("BEFORE seedPosition:");
+        console2.log(string.concat("  Hook ETH:    ", _formatEther(address(hook).balance), " ether"));
+        console2.log(string.concat("  Hook Token1: ", vm.toString(currency1.balanceOf(address(hook))), " * 1e18"));
+
         _seed(1 ether, 1 ether);
+
+        _logHookState("AFTER seedPosition");
+
         assertTrue(hook.seeded(), "must be seeded");
         assertEq(hook.currentTickLower(), -HALF_WIDTH, "lower = -halfWidth around tick 0");
         assertEq(hook.currentTickUpper(), HALF_WIDTH, "upper = +halfWidth around tick 0");
@@ -125,22 +157,40 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     // ----------------------------------------------------------------------- //
 
     function test_swap_belowThreshold_noReinvest() public {
+        console2.log("");
+        console2.log("=== test_swap_belowThreshold_noReinvest ===");
         _seed(1 ether, 1 ether);
+        _logHookState("AFTER seedPosition");
+
         int24 lowerBefore = hook.currentTickLower();
         int24 upperBefore = hook.currentTickUpper();
 
-        // Swap so small that fee on input < threshold.
+        console2.log("");
+        console2.log("BEFORE swap (0.0001 ETH):");
+        console2.log(string.concat("  Fee generated: ~", _formatEther(0.0001 ether * 3000 / 1000000), " ETH (below ", _formatEther(FEE_THRESHOLD_ETH), " threshold)"));
+
         _swapZeroForOne(0.0001 ether); // 0.0001 ETH * 0.3% = 3e-7 ETH ≪ 1e-5 threshold
+
+        _logHookState("AFTER swap (no reinvest expected)");
 
         assertEq(hook.currentTickLower(), lowerBefore, "range unchanged");
         assertEq(hook.currentTickUpper(), upperBefore, "range unchanged");
     }
 
     function test_swap_aboveThreshold_reinvests() public {
+        console2.log("");
+        console2.log("=== test_swap_aboveThreshold_reinvests ===");
         _seed(1 ether, 1 ether);
+        _logHookState("AFTER seedPosition");
+
         int24 lowerBefore = hook.currentTickLower();
         int24 upperBefore = hook.currentTickUpper();
         uint128 liqBefore = hook.currentLiquidity();
+
+        console2.log("");
+        console2.log("BEFORE swap (0.01 ETH):");
+        console2.log(string.concat("  Fee generated: ~", _formatEther(0.01 ether * 3000 / 1000000), " ETH (above ", _formatEther(FEE_THRESHOLD_ETH), " threshold)"));
+        console2.log("  Expected: reinvest will trigger");
 
         // 0.01 ETH * 0.3% = 3e-5 ETH > 1e-5 threshold → reinvest fires.
         vm.recordLogs();
@@ -156,6 +206,15 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         }
         assertTrue(sawRebalance, "PositionRebalanced must be emitted");
 
+        _logHookState("AFTER swap with reinvest");
+
+        console2.log("");
+        console2.log("Reinvest analysis:");
+        console2.log(string.concat("  Old range: [", _formatTick(lowerBefore), ", ", _formatTick(upperBefore), "]"));
+        console2.log(string.concat("  New range: [", _formatTick(hook.currentTickLower()), ", ", _formatTick(hook.currentTickUpper()), "]"));
+        console2.log(string.concat("  Liquidity before: ", vm.toString(uint256(liqBefore))));
+        console2.log(string.concat("  Liquidity after:  ", vm.toString(uint256(hook.currentLiquidity())), " (includes accrued fees)"));
+
         // After reinvest the range is recentered around the post-swap tick → at least one bound moved.
         bool rangeMoved = (hook.currentTickLower() != lowerBefore) || (hook.currentTickUpper() != upperBefore);
         assertTrue(rangeMoved, "range must shift after reinvest");
@@ -165,19 +224,36 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     }
 
     function test_followsPrice() public {
+        console2.log("");
+        console2.log("=== test_followsPrice ===");
         _seed(1 ether, 1 ether);
+        _logHookState("AFTER seedPosition");
 
         // Push price down with several oneForZero-style swaps in the same direction. Each big
         // enough to cross the fee threshold, so each triggers a reinvest re-centering the range.
         for (uint256 i = 0; i < 3; i++) {
+            console2.log("");
+            console2.log(string.concat("--- Swap ", vm.toString(i + 1), ": 0.05 ETH ---"));
+            console2.log("BEFORE:");
+            console2.log(string.concat("  Range center: ", _formatTick((hook.currentTickLower() + hook.currentTickUpper()) / 2)));
+
             _swapZeroForOne(0.05 ether);
+
+            _logHookState(string.concat("AFTER swap ", vm.toString(i + 1)));
         }
 
         int24 tickAfter = _currentTick();
         int24 center = (hook.currentTickLower() + hook.currentTickUpper()) / 2;
+        int24 diff = tickAfter > center ? tickAfter - center : center - tickAfter;
+
+        console2.log("");
+        console2.log("Final analysis:");
+        console2.log(string.concat("  Pool tick:       ", _formatTick(tickAfter)));
+        console2.log(string.concat("  Range center:    ", _formatTick(center)));
+        console2.log(string.concat("  Difference:      ", vm.toString(uint256(int256(diff)))));
+        console2.log(string.concat("  Tick spacing:    ", vm.toString(uint256(int256(key.tickSpacing)))));
 
         // The new range must be centered near the post-swap tick (within one tickSpacing).
-        int24 diff = tickAfter > center ? tickAfter - center : center - tickAfter;
         assertLt(diff, key.tickSpacing * 2, "new range center should track current tick");
     }
 
@@ -186,20 +262,36 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     // ----------------------------------------------------------------------- //
 
     function test_native_dustHandling() public {
-        _seed(1 ether, 1 ether);
+        console2.log("");
+        console2.log("=== test_native_dustHandling ===");
+        console2.log("Testing accounting correctness: hook should not hold more than seeded + swapped");
 
-        // After a single reinvest, leftover idle on either side can be a non-trivial fraction
-        // of the seeded amount: an asymmetric range around the post-swap tick may need a very
-        // different (token0, token1) ratio than the burn returned, and the baseline omits the
-        // rebalance swap. The invariant we DO want is that the hook isn't somehow holding more
-        // than the original deposit + swap input — that would mean we mismatched accounting.
+        console2.log("");
+        console2.log("Deposit: 1.0000 ETH + 1.0000e18 token1");
+        _seed(1 ether, 1 ether);
+        _logHookState("AFTER seedPosition");
+
+        console2.log("");
+        console2.log("Performing swap: 0.05 ETH");
         _swapZeroForOne(0.05 ether);
+
+        _logHookState("AFTER swap (reinvest triggered)");
 
         uint256 hookEthAfter = address(hook).balance;
         uint256 hookT1After = currency1.balanceOf(address(hook));
 
+        console2.log("");
+        console2.log("Accounting check:");
+        console2.log(string.concat("  Max ETH allowed:    ", _formatEther(1 ether + 0.05 ether), " (deposit 1.0 + swap 0.05)"));
+        console2.log(string.concat("  Actual ETH:         ", _formatEther(hookEthAfter)));
+        console2.log("  Max token1 allowed: 1.0000e18");
+        console2.log(string.concat("  Actual token1:      ", vm.toString(hookT1After), "e18"));
+
         // Sanity bound: leftover ≤ amount the hook ever owned in either currency.
         assertLe(hookEthAfter, 1 ether + 0.05 ether, "hook ETH bounded by deposit + swap input");
         assertLe(hookT1After, 1 ether, "hook token1 bounded by deposit");
+
+        console2.log("");
+        console2.log("[OK] Accounting is correct - no excess holdings");
     }
 }
