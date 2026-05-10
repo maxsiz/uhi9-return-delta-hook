@@ -39,7 +39,11 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         console2.log(string.concat("hook:ETH:     ", _formatEther(address(hook).balance), " ether"));
         console2.log(string.concat("hook:Token1:  ", vm.toString(currency1.balanceOf(address(hook)))));
         console2.log(string.concat("PM:ETH:     ", _formatEther(address(manager).balance), " ether"));
-        console2.log(string.concat("PM:Token1:  ", vm.toString(currency1.balanceOf(address(manager)))));
+        console2.log(string.concat(
+            "PM:Token1:  ", 
+            vm.toString(currency1.balanceOf(address(manager))),", ",
+            _formatEther(currency1.balanceOf(address(manager))), "eth"
+        ));
 
         int24 center = (hook.currentTickLower() + hook.currentTickUpper()) / 2;
         console2.log(string.concat("Tick center: ", _formatTick(center), " (current ", _formatTick(tickCurrent), ")"));
@@ -135,7 +139,7 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         // console2.log(string.concat("  Hook ETH:    ", _formatEther(address(hook).balance), " ether"));
         // console2.log(string.concat("  Hook Token1: ", vm.toString(currency1.balanceOf(address(hook))), " * 1e18"));
         _logHookState("BEFORE seedPosition");
-        _seed(1 ether, 2000e6);
+        _seed(1 ether, 2000e18);
 
         _logHookState("AFTER seedPosition");
         (uint160 sqrtPrice, int24 tickCurrent,,) = manager.getSlot0(key.toId());
