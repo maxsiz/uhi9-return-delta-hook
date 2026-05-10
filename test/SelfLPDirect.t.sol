@@ -68,8 +68,19 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         );
         hook = SelfLPDirect(payable(hookAddress));
 
+        /*
+        Пример — ETH по 2000 USDC (pool: ETH = currency0, USDC = currency1, price = 2000):                                                                                                                                                                                      
+        import {TickMath} from "v4-core/libraries/TickMath.sol";
+        */
+          // price = amount1/amount0 = 2000                                                                                                                                                                                                                                       
+          // tick ≈ ln(2000) / ln(1.0001) ≈ 75070                                                                                                                                                                                                                                 
+        int24 tick = 74961;                                                                                                                                                                                                                                                     
+        uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(tick);           
+        
         // Initialize the pool. ETH = currency0 (Deployers sorts so address(0) < ERC20).
-        (key,) = initPool(ethCurrency, currency1, hook, LPFeeLibrary.DYNAMIC_FEE_FLAG, SQRT_PRICE_1_1);
+        (key,) = initPool(ethCurrency, currency1, hook, LPFeeLibrary.DYNAMIC_FEE_FLAG, sqrtPrice);
+        // Price: 1 = 1 
+        //(key,) = initPool(ethCurrency, currency1, hook, LPFeeLibrary.DYNAMIC_FEE_FLAG, SQRT_PRICE_1_1);
 
         // Test contract needs ETH to seed and to swap.
         vm.deal(address(this), 100 ether);
@@ -122,7 +133,7 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         console2.log(string.concat("  Hook ETH:    ", _formatEther(address(hook).balance), " ether"));
         console2.log(string.concat("  Hook Token1: ", vm.toString(currency1.balanceOf(address(hook))), " * 1e18"));
 
-        _seed(1 ether, 1 ether);
+        _seed(1 ether, 2000e6);
 
         _logHookState("AFTER seedPosition");
 
