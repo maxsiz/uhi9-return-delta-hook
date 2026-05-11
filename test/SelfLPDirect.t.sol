@@ -224,7 +224,7 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     function test_swap_aboveThreshold_reinvests() public {
         console2.log("");
         console2.log("=== test_swap_aboveThreshold_reinvests ===");
-        _seed(1 ether, 1 ether);
+        _seed(1 ether, 2000 ether);
         _logHookState("AFTER seedPosition");
 
         int24 lowerBefore = hook.currentTickLower();
