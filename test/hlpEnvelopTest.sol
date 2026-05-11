@@ -2,15 +2,15 @@
 pragma solidity ^0.8.0;
 import "forge-std/Test.sol";
 contract hlpEnvelopTest is Test  {
-   // Хелпер для форматирования в ETH с 3 знаками
+   // Хелпер для форматирования в ETH с  знаками
     function _formatEther(uint256 wei_) internal pure returns (string memory) {
         uint256 whole = wei_ / 1 ether;
-        uint256 frac  = (wei_ % 1 ether) / 1e14;  // 4 знака
+        uint256 frac  = (wei_ % 1 ether) / 1e10;  // 4 знака
 
         return string.concat(
             vm.toString(whole),
             ".",
-            _padLeft(vm.toString(frac), 4)
+            _padLeft(vm.toString(frac), 8)
         );
     }
 

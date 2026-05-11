@@ -102,6 +102,8 @@ contract SelfLPDirect is BaseHook, IUnlockCallback {
         int24 oldLower, int24 oldUpper, int24 newLower, int24 newUpper, uint128 newLiquidity
     );
 
+    event DebugEvent(uint256 point);
+
     /// @dev unlockCallback action discriminator. Currently only SEED uses it; the reinvest path
     ///      runs inside the swapper's already-open unlock and does not re-enter `unlock()`.
     enum Action {
@@ -261,7 +263,7 @@ contract SelfLPDirect is BaseHook, IUnlockCallback {
     ) internal override returns (bytes4, int128) {
         // Fast no-op until the position is funded.
         if (!seeded) return (this.afterSwap.selector, 0);
-
+        
         // View-side fee preview — no SSTORE, no unlock — keeps the no-op path cheap.
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(_poolId);
         uint256 feesEth = SelfLPLib.previewFeesETH(
@@ -277,7 +279,7 @@ contract SelfLPDirect is BaseHook, IUnlockCallback {
             })
         );
         if (feesEth < feeThresholdETH) return (this.afterSwap.selector, 0);
-
+        
         _reinvest(key, sqrtPriceX96);
         return (this.afterSwap.selector, 0);
     }
@@ -307,7 +309,7 @@ contract SelfLPDirect is BaseHook, IUnlockCallback {
         int24 oldLower = currentTickLower;
         int24 oldUpper = currentTickUpper;
         uint128 oldLiq = currentLiquidity;
-
+        
         // 1. Burn old position. burnDelta > 0 on both sides (principal + accrued fees).
         (BalanceDelta burnDelta,) = poolManager.modifyLiquidity(
             key,

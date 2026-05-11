@@ -78,9 +78,35 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         Пример — ETH по 2000 USDC (pool: ETH = currency0, USDC = currency1, price = 2000):                                                                                                                                                                                      
         import {TickMath} from "v4-core/libraries/TickMath.sol";
         */
+        /*
+        Расчёт для курса 1:2000                                                                                                                                                                     
+                                                                                                                                                                                                      
+        tick = ln(2000) / ln(1.0001)                                                                                                                                                                
+           = 7.6009025 / 0.0000999950                                                                                                                                                             
+           ≈ 76012.04                                                                                                                                                                             
+                                                                                                                                                                                                      
+        Реальный тик для price = 2000 равен ~76012, а не 75060 (как в текущем тесте).                                                                                                               
+                                                                                                                                                                                                      
+          Проверка: что даёт текущий tick = 75060?                                                                                                                                                    
+                                                                                                                                                                                                      
+          price = 1.0001^75060 = e^(75060 × 0.0000999950) = e^7.5056 ≈ 1817.74                                                                                                                        
+                                                                                                                                                                                                      
+          Поэтому твой тест и показывает PM:Token1: 1818.2408eth — пул считает по реальному курсу 1818, а не 2000.                                                                                    
+                                                                                                                                                                                                      
+          ---                                                                                                                                                                                         
+          Снаппинг к tickSpacing = 60                                                                                                                                                                 
+                                                                                                                                                                                                      
+          Тик должен быть кратен 60:                                                                                                                                                                  
+                                                                                                                                                                                                      
+          76012 / 60 = 1266.87                                                                                                                                                                        
+          → варианты:                                                                                                                                                                                 
+             1266 × 60 = 75960 → price = e^(75960×0.00009999) = e^7.5946 ≈ 1995.26                                                                                                                    
+             1267 × 60 = 76020 → price ≈ 2001.59  ← ближе к 2000      
+
+        Ответ: tick = 76020 даёт price ≈ 2001.6, отклонение 0.08%.              
+        */
           // price = amount1/amount0 = 2000                                                                                                                                                                                                                                       
-          // tick ≈ ln(2000) / ln(1.0001) ≈ 75070                                                                                                                                                                                                                                 
-        int24 tick = 75060;                                                                                                                                                                                                                                                     
+        int24 tick = 76020;                                                                                                                                                                                                                                                     
         uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(tick);           
         
         // Initialize the pool. ETH = currency0 (Deployers sorts so address(0) < ERC20).
@@ -150,34 +176,34 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         assertGt(hook.currentLiquidity(), 0, "liquidity > 0");
     }
 
-    // function test_seedPosition_idempotent() public {
-    //     _seed(1 ether, 1 ether);
-    //     vm.expectRevert(SelfLPDirect.AlreadySeeded.selector);
-    //     hook.seedPosition{value: 1 ether}(1 ether, 1 ether);
-    // }
+    function test_seedPosition_idempotent() public {
+        _seed(1 ether, 1 ether);
+        vm.expectRevert(SelfLPDirect.AlreadySeeded.selector);
+        hook.seedPosition{value: 1 ether}(1 ether, 1 ether);
+    }
 
-    // function test_seedPosition_wrongMsgValue() public {
-    //     // ETH is currency0; msg.value must equal amount0.
-    //     vm.expectRevert(SelfLPDirect.WrongMsgValue.selector);
-    //     hook.seedPosition{value: 0.5 ether}(1 ether, 1 ether);
-    // }
+    function test_seedPosition_wrongMsgValue() public {
+        // ETH is currency0; msg.value must equal amount0.
+        vm.expectRevert(SelfLPDirect.WrongMsgValue.selector);
+        hook.seedPosition{value: 0.5 ether}(1 ether, 1 ether);
+    }
 
-    // function test_seedPosition_onlyOwner() public {
-    //     address attacker = address(0xBEEF);
-    //     vm.deal(attacker, 10 ether);
-    //     vm.prank(attacker);
-    //     vm.expectRevert(SelfLPDirect.NotOwner.selector);
-    //     hook.seedPosition{value: 1 ether}(1 ether, 1 ether);
-    // }
+    function test_seedPosition_onlyOwner() public {
+        address attacker = address(0xBEEF);
+        vm.deal(attacker, 10 ether);
+        vm.prank(attacker);
+        vm.expectRevert(SelfLPDirect.NotOwner.selector);
+        hook.seedPosition{value: 1 ether}(1 ether, 1 ether);
+    }
 
-    // // ----------------------------------------------------------------------- //
-    // // afterSwap — threshold gate                                              //
-    // // ----------------------------------------------------------------------- //
+    // ----------------------------------------------------------------------- //
+    // afterSwap — threshold gate                                              //
+    // ----------------------------------------------------------------------- //
 
     // function test_swap_belowThreshold_noReinvest() public {
     //     console2.log("");
     //     console2.log("=== test_swap_belowThreshold_noReinvest ===");
-    //     _seed(1 ether, 1 ether);
+    //     _seed(1 ether, 2000 ether);
     //     _logHookState("AFTER seedPosition");
 
     //     int24 lowerBefore = hook.currentTickLower();
@@ -195,51 +221,55 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
     //     assertEq(hook.currentTickUpper(), upperBefore, "range unchanged");
     // }
 
-    // function test_swap_aboveThreshold_reinvests() public {
-    //     console2.log("");
-    //     console2.log("=== test_swap_aboveThreshold_reinvests ===");
-    //     _seed(1 ether, 1 ether);
-    //     _logHookState("AFTER seedPosition");
+    function test_swap_aboveThreshold_reinvests() public {
+        console2.log("");
+        console2.log("=== test_swap_aboveThreshold_reinvests ===");
+        _seed(1 ether, 1 ether);
+        _logHookState("AFTER seedPosition");
 
-    //     int24 lowerBefore = hook.currentTickLower();
-    //     int24 upperBefore = hook.currentTickUpper();
-    //     uint128 liqBefore = hook.currentLiquidity();
+        int24 lowerBefore = hook.currentTickLower();
+        int24 upperBefore = hook.currentTickUpper();
+        uint128 liqBefore = hook.currentLiquidity();
 
-    //     console2.log("");
-    //     console2.log("BEFORE swap (0.01 ETH):");
-    //     console2.log(string.concat("  Fee generated: ~", _formatEther(0.01 ether * 3000 / 1000000), " ETH (above ", _formatEther(FEE_THRESHOLD_ETH), " threshold)"));
-    //     console2.log("  Expected: reinvest will trigger");
+        console2.log("");
+        console2.log("BEFORE swap (0.01 ETH):");
+        console2.log(string.concat(
+            "  Fee generated: ~", _formatEther(0.01 ether * 3000 / 1000000), 
+            " ETH (above ", _formatEther(FEE_THRESHOLD_ETH), " threshold)"
+        ));
+        console2.log("  Expected: reinvest will trigger");
 
-    //     // 0.01 ETH * 0.3% = 3e-5 ETH > 1e-5 threshold → reinvest fires.
-    //     vm.recordLogs();
-    //     _swapZeroForOne(0.01 ether);
-    //     Vm.Log[] memory logs = vm.getRecordedLogs();
+        // 0.01 ETH * 0.3% = 3e-5 ETH > 1e-5 threshold → reinvest fires.
+        vm.recordLogs();
+        _swapZeroForOne(0.01 ether);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
 
-    //     bool sawRebalance = false;
-    //     for (uint256 i = 0; i < logs.length; i++) {
-    //         if (logs[i].topics[0] == SelfLPDirect.PositionRebalanced.selector) {
-    //             sawRebalance = true;
-    //             break;
-    //         }
-    //     }
-    //     assertTrue(sawRebalance, "PositionRebalanced must be emitted");
+        bool sawRebalance = false;
+        for (uint256 i = 0; i < logs.length; i++) {
+             console2.log(vm.toString(logs[i].topics[0]));
+            if (logs[i].topics[0] == SelfLPDirect.PositionRebalanced.selector) {
+                sawRebalance = true;
+                break;
+            }
+        }
+        assertTrue(sawRebalance, "PositionRebalanced must be emitted");
 
-    //     _logHookState("AFTER swap with reinvest");
+        _logHookState("AFTER swap with reinvest");
 
-    //     console2.log("");
-    //     console2.log("Reinvest analysis:");
-    //     console2.log(string.concat("  Old range: [", _formatTick(lowerBefore), ", ", _formatTick(upperBefore), "]"));
-    //     console2.log(string.concat("  New range: [", _formatTick(hook.currentTickLower()), ", ", _formatTick(hook.currentTickUpper()), "]"));
-    //     console2.log(string.concat("  Liquidity before: ", vm.toString(uint256(liqBefore))));
-    //     console2.log(string.concat("  Liquidity after:  ", vm.toString(uint256(hook.currentLiquidity())), " (includes accrued fees)"));
+        console2.log("");
+        console2.log("Reinvest analysis:");
+        console2.log(string.concat("  Old range: [", _formatTick(lowerBefore), ", ", _formatTick(upperBefore), "]"));
+        console2.log(string.concat("  New range: [", _formatTick(hook.currentTickLower()), ", ", _formatTick(hook.currentTickUpper()), "]"));
+        console2.log(string.concat("  Liquidity before: ", vm.toString(uint256(liqBefore))));
+        console2.log(string.concat("  Liquidity after:  ", vm.toString(uint256(hook.currentLiquidity())), " (includes accrued fees)"));
 
-    //     // After reinvest the range is recentered around the post-swap tick → at least one bound moved.
-    //     bool rangeMoved = (hook.currentTickLower() != lowerBefore) || (hook.currentTickUpper() != upperBefore);
-    //     assertTrue(rangeMoved, "range must shift after reinvest");
-    //     assertGt(hook.currentLiquidity(), 0, "still has liquidity");
-    //     // Liquidity may differ from before (fees rolled back in plus any idle dust contribution).
-    //     liqBefore;
-    // }
+        // After reinvest the range is recentered around the post-swap tick → at least one bound moved.
+        bool rangeMoved = (hook.currentTickLower() != lowerBefore) || (hook.currentTickUpper() != upperBefore);
+        assertTrue(rangeMoved, "range must shift after reinvest");
+        assertGt(hook.currentLiquidity(), 0, "still has liquidity");
+        // Liquidity may differ from before (fees rolled back in plus any idle dust contribution).
+        liqBefore;
+    }
 
     // function test_followsPrice() public {
     //     console2.log("");
