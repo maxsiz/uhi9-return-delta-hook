@@ -80,7 +80,7 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         */
           // price = amount1/amount0 = 2000                                                                                                                                                                                                                                       
           // tick ≈ ln(2000) / ln(1.0001) ≈ 75070                                                                                                                                                                                                                                 
-        int24 tick = 75060;                                                                                                                                                                                                                                                     
+        int24 tick = 10000;                                                                                                                                                                                                                                                     
         uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(tick);           
         
         // Initialize the pool. ETH = currency0 (Deployers sorts so address(0) < ERC20).
@@ -92,6 +92,7 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         vm.deal(address(this), 100 ether);
         // Approve currency1 to the hook so seedPosition's transferFrom works.
         MockERC20(Currency.unwrap(currency1)).approve(address(hook), type(uint256).max);
+        console2.log("Pool tickSpacing: %s", key.tickSpacing);
     }
 
     function _seed(uint256 amount0, uint256 amount1) internal {
