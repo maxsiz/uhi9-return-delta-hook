@@ -80,7 +80,7 @@ contract TestSelfLPDirect is Test, Deployers, hlpEnvelopTest {
         */
           // price = amount1/amount0 = 2000                                                                                                                                                                                                                                       
           // tick ≈ ln(2000) / ln(1.0001) ≈ 75070                                                                                                                                                                                                                                 
-        int24 tick = 10000;                                                                                                                                                                                                                                                     
+        int24 tick = 75060;                                                                                                                                                                                                                                                     
         uint160 sqrtPrice = TickMath.getSqrtPriceAtTick(tick);           
         
         // Initialize the pool. ETH = currency0 (Deployers sorts so address(0) < ERC20).
