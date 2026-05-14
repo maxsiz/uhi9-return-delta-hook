@@ -275,7 +275,7 @@ contract TokenLaunchHook is BaseHook {
             // Anti-sandwich: only deployer (or his AA wallet) can do first mint
             require(tx.origin == cfg.deployer, "Wrong first LP");
             
-            // Capture governance NFT via salt convention
+            // Capture governance NFT via salt = bytes32(tokenId) convention (verified in PosM)
             state.config = cfg;
             state.governanceTokenId = uint256(params.salt);
             state.initialized = true;
@@ -417,41 +417,267 @@ This eliminates:
 
 The price: a hook bug found post-deploy means migrate-or-live-with-it. Mitigated via thorough audit + bug bounty pre-launch.
 
+## Modular Mechanism Architecture
+
+Inside `TokenLaunchHook`, individual launch mechanics (anti-snipe, tax, liquidity-lock, whitelist, etc.) are isolated as **abstract Solidity contracts** ("mechanism modules"). The main hook inherits the modules it supports; **per-launch config** specifies which are active.
+
+### Pattern: Abstract inheritance + enable flags
+
+```solidity
+// ─── Each mechanism is a separate abstract contract ───
+
+abstract contract AntiSnipeMechanism {
+    struct AntiSnipeConfig { /* immutable + mutable params */ }
+    struct AntiSnipeState  { /* runtime tracking */ }
+    
+    mapping(PoolId => AntiSnipeConfig) internal _antiSnipeConfigs;
+    mapping(PoolId => AntiSnipeState)  internal _antiSnipeStates;
+    
+    function _initAntiSnipe(PoolId pid, bytes calldata data) internal { ... }
+    function _checkAntiSnipe(PoolId pid, address trader, uint256 amount, bool isBuy) 
+        internal returns (bool) { ... }
+    
+    // governance setter for mutable params
+    function setAntiSnipeMaxBuy(PoolId pid, uint16 newBps) external virtual;
+    
+    event AntiSnipeInitialized(PoolId indexed pid, AntiSnipeConfig cfg);
+    event AntiSnipeRejected(PoolId indexed pid, address indexed trader, string reason);
+}
+
+abstract contract BuySellTaxMechanism { /* same pattern */ }
+abstract contract LiquidityLockMechanism { /* same pattern */ }
+// ... more
+
+// ─── TokenLaunchHook inherits all supported mechanisms ───
+
+contract TokenLaunchHook is
+    BaseHook,
+    AntiSnipeMechanism,
+    BuySellTaxMechanism,
+    LiquidityLockMechanism,
+    WhitelistPhaseMechanism,
+    SniperBlacklistMechanism,
+    GovernanceModule
+{
+    struct EnabledMechanisms {
+        bool antiSnipe;
+        bool tax;
+        bool lock;
+        bool whitelist;
+        bool sniperBlacklist;
+        // future v2: bondingCurve, autoBuyback, treasuryRoute
+    }
+    
+    mapping(PoolId => EnabledMechanisms) public enabled;
+    
+    // Hook orchestrates which modules to invoke per callback
+    function _beforeSwap(...) returns (bytes4, BeforeSwapDelta, uint24) {
+        PoolId pid = key.toId();
+        EnabledMechanisms memory en = enabled[pid];
+        
+        if (en.whitelist) {
+            require(_isWhitelisted(pid, tx.origin, params), "Not whitelisted");
+        }
+        if (en.antiSnipe) {
+            require(_checkAntiSnipe(pid, tx.origin, _amount(params), _isBuy(params)), "Snipe");
+        }
+        if (en.sniperBlacklist) {
+            require(!_isSniperBlacklisted(pid, tx.origin), "Blacklisted");
+        }
+        
+        uint24 fee = en.tax 
+            ? _calculateTax(pid, _isBuy(params), block.timestamp - _launchTime(pid)) 
+            : 0;
+        
+        return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), fee);
+    }
+    
+    function _beforeAddLiquidity(...) returns (bytes4) {
+        // bootstrap on first mint — dispatch _init* for each enabled module
+    }
+    
+    function _beforeRemoveLiquidity(...) returns (bytes4) {
+        if (enabled[pid].lock) {
+            require(_canRemoveLiquidity(pid, params), "Locked");
+        }
+    }
+}
+```
+
+### Storage isolation
+
+Each mechanism declares **its own state variables with unique names** — no slot collision under Solidity's default storage layout. Example:
+
+```solidity
+abstract contract AntiSnipeMechanism {
+    mapping(PoolId => AntiSnipeConfig) internal _antiSnipeConfigs;
+    mapping(PoolId => mapping(address => uint64)) internal _lastBuyBlock;
+}
+
+abstract contract BuySellTaxMechanism {
+    mapping(PoolId => TaxConfig) internal _taxConfigs;
+}
+// Different storage slots, no conflict.
+```
+
+**Future-proofing:** if mechanisms get added/removed across versions, consider ERC-7201 namespaced storage (per-module fixed slot via `keccak256`). Overkill for v1 but recommended for v2+.
+
+### Mechanism module template
+
+Every module follows the same shape for predictability:
+
+```solidity
+abstract contract <Name>Mechanism {
+    struct <Name>Config { /* immutable + mutable params */ }
+    struct <Name>State  { /* runtime tracking */ }
+    
+    mapping(PoolId => <Name>Config) internal _<name>Configs;
+    mapping(PoolId => <Name>State)  internal _<name>States;
+    
+    // Init (called from _beforeAddLiquidity bootstrap)
+    function _init<Name>(PoolId pid, bytes calldata data) internal;
+    
+    // Predicate/check (called from hook callbacks, modifies state if needed)
+    function _<predicate>(PoolId pid, ...) internal returns (bool);
+    
+    // View functions (external readers)
+    function get<Name>Config(PoolId pid) external view returns (<Name>Config memory);
+    
+    // Governance setters (mutable params, must be virtual + override-able)
+    function set<Mutable>(PoolId pid, ...) external virtual;
+    
+    // Events
+    event <Name>Initialized(PoolId indexed pid, <Name>Config cfg);
+    event <Name>Rejected(PoolId indexed pid, address indexed who, string reason);
+    event <Name>ParamUpdated(PoolId indexed pid, string param, bytes newValue);
+}
+```
+
+### Why not external plugins / dynamic dispatch
+
+We considered:
+- **External plugin contracts** with `IMechanismPlugin` interface — rejected because external calls cost gas, security review per plugin needed, reentrancy concerns.
+- **Library pattern** (stateless libs, storage in hook) — rejected because it doesn't give true encapsulation; main hook ends up with all state declarations directly.
+- **Solidity Diamond standard (EIP-2535)** — rejected as overkill for non-upgradeable contract.
+
+Abstract inheritance is the **right level of modularity** for our problem: code organization + isolated testing + audit-friendly boundaries, with zero runtime overhead.
+
+### Module catalog (v1 + planned v2)
+
+| ID | Module | Hook permissions used | v1 / v2 | Status |
+|----|--------|------------------------|---------|--------|
+| **M1** | `AntiSnipeMechanism` | `_beforeSwap` (revert) | **v1** | Mandatory |
+| **M2** | `BuySellTaxMechanism` (dynamic LP fee) | `_beforeSwap` (fee override) | **v1** | Mandatory |
+| **M3** | `LiquidityLockMechanism` (incl. vesting) | `_beforeRemoveLiquidity` (revert) | **v1** | Mandatory (was M3+M4 merged) |
+| **M5** | `WhitelistPhaseMechanism` | `_beforeSwap` + `_beforeAddLiquidity` (revert) | **v1** | Optional per-launch |
+| **M9** | `HolderCapMechanism` | `_afterSwap` (track) + `_beforeSwap` (limit) | **v1** | Optional |
+| **M10** | `MinHoldTimeMechanism` (anti-flip) | `_beforeSwap` (track + revert) | **v1** | Optional |
+| **M11** | `AutoBurnMechanism` (% of volume) | `_afterSwap` | **v1** | Optional |
+| **M12** | `InsiderRulesMechanism` (different tax/lock for whitelisted addresses) | `_beforeSwap` | **v1** | Optional |
+| **M13** | `SniperBlacklistMechanism` (block-0 buyer snapshot) | `_afterSwap` (track) + `_beforeSwap` (check) | **v1** | Optional, complements M1 |
+| **M14** | `TradeVolumeCapMechanism` (max % per address) | `_beforeSwap` (track + limit) | **v1** | Optional |
+| **M8** | `TreasuryFeeRoutingMechanism` | `_afterSwap` + `afterSwapReturnDelta` | **v2** | Requires custom accounting; post-allowlist |
+| **M6** | `BondingCurveFallbackMechanism` | `_beforeSwap` + `beforeSwapReturnDelta` | **v2** | Complex math; post-allowlist |
+| **M7** | `AutoBuybackMechanism` | `_afterSwap` + atomic swap | **v2** | Defer to v2 |
+
+**Merged / dropped:**
+- M4 (Vesting) → merged into M3 (LiquidityLock supports vesting schedule as one of its unlock modes)
+- ~~M6, M7~~ → deferred to v2 (custom-accounting permissions, more design needed)
+
+### Per-launch enable flags + presets
+
+Custom UI can offer **presets** that pre-select sensible flag combinations:
+
+| Preset | Enabled mechanisms |
+|--------|--------------------|
+| **Memecoin** | M1 + M2 + M3 + M13 + M14 |
+| **Fair Launch** | M1 + M2 + M3 + M9 + M14 |
+| **RWA / Permissioned** | M3 + M5 + M12 |
+| **DAO Token** | M2 + M3 + M11 |
+| **Custom** | Full toggle UI for all modules |
+
+Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAddLiquidity` from hookData). It's part of the immutable config — cannot be changed post-launch. Within enabled modules, **mutable params** are still adjustable by governance NFT owner.
+
 ## Critical Files to Create
 
-### On-chain contracts (one deploy per chain)
+### Core on-chain contracts (one deploy per chain)
 
 | File | Purpose |
 |------|---------|
-| `src/TokenLaunchHook.sol` | Single hook contract for ALL launches on this chain. Inherits `BaseHook` **unchanged**. Storage: `mapping(PoolId => CampaignState)`. Submitted to Uniswap allowlist once. Mined CREATE2 salt for permission flag bits. |
-| `src/CampaignWrapper.sol` | Non-upgradeable coordinator. Single function `launchCampaign(params, permitSig)` does everything atomically via PosM multicall. Optionally invokes TokenFactory. |
-| `src/TokenFactory.sol` | Deploys cheap ERC-20 tokens via EIP-1167 minimal proxies (`Clones.clone` from OpenZeppelin). Independent of hook — no allowlist concerns. |
-| `src/StandardToken.sol` | Initializable ERC-20 implementation cloned by TokenFactory. Standard `mint to recipient` semantics. |
-| `src/lib/LaunchMath.sol` | Tax calculation, decay curves, bonding curve math (pure library) |
+| `src/TokenLaunchHook.sol` | Main hook. Inherits `BaseHook` **unchanged** + all mechanism modules. Storage: `mapping(PoolId => CampaignState)` + `enabled` flags. Orchestrates module dispatch in callbacks. Submitted to Uniswap allowlist once. |
+| `src/CampaignWrapper.sol` | Non-upgradeable coordinator. `launchCampaign(params, permitSig)` does everything atomically via PosM multicall. Optionally invokes TokenFactory. |
+| `src/TokenFactory.sol` | Deploys cheap ERC-20 tokens via EIP-1167 minimal proxies. Independent of hook. |
+| `src/StandardToken.sol` | Initializable ERC-20 implementation cloned by TokenFactory. |
+
+### Mechanism modules (abstract contracts in `src/mechanisms/`)
+
+| File | Module | Status |
+|------|--------|--------|
+| `src/mechanisms/AntiSnipeMechanism.sol` | M1 — block-window anti-snipe | v1 mandatory |
+| `src/mechanisms/BuySellTaxMechanism.sol` | M2 — asymmetric tax via dynamic LP fee | v1 mandatory |
+| `src/mechanisms/LiquidityLockMechanism.sol` | M3 — conditional + vesting unlock | v1 mandatory |
+| `src/mechanisms/WhitelistPhaseMechanism.sol` | M5 — phased KYC/allowlist access | v1 optional |
+| `src/mechanisms/HolderCapMechanism.sol` | M9 — max-N-holders enforcement | v1 optional |
+| `src/mechanisms/MinHoldTimeMechanism.sol` | M10 — anti-flip cool-down | v1 optional |
+| `src/mechanisms/AutoBurnMechanism.sol` | M11 — % of volume burned | v1 optional |
+| `src/mechanisms/InsiderRulesMechanism.sol` | M12 — separate rules for whitelisted insiders | v1 optional |
+| `src/mechanisms/SniperBlacklistMechanism.sol` | M13 — block-0 buyer blacklist | v1 optional |
+| `src/mechanisms/TradeVolumeCapMechanism.sol` | M14 — max % supply per address | v1 optional |
+| `src/mechanisms/GovernanceModule.sol` | Governance NFT capture + setters (common to all) | v1 mandatory |
+| `src/mechanisms/TreasuryFeeRoutingMechanism.sol` | M8 — fees to treasury via afterSwapReturnDelta | v2 (post-allowlist) |
+| `src/mechanisms/BondingCurveMechanism.sol` | M6 — fallback for thin-liquidity launches | v2 |
+| `src/mechanisms/AutoBuybackMechanism.sol` | M7 — atomic counter-buy on sell pressure | v2 |
+
+Each mechanism file is a self-contained abstract contract following the [module template](#mechanism-module-template). One test file per module: `test/mechanisms/<Name>Mechanism.t.sol`.
+
+### Libraries
+
+| File | Purpose |
+|------|---------|
+| `src/lib/LaunchMath.sol` | Tax decay curves, time math (pure library shared across modules) |
 | `src/lib/UnlockConditions.sol` | Unlock condition predicates (time, volume, holders, price) |
-| `script/MineSalt.s.sol` | Off-chain Foundry helper to compute CREATE2 salt for `TokenLaunchHook` so its address has the required permission flag bits |
+| `src/lib/MechanismConfig.sol` | Encoding/decoding helpers for hookData → per-module configs |
+
+### Deploy scripts
+
+| File | Purpose |
+|------|---------|
+| `script/MineSalt.s.sol` | Off-chain Foundry helper to compute CREATE2 salt for `TokenLaunchHook` address (correct permission flag bits) |
 | `script/DeployStack.s.sol` | One-time per-chain deploy: mine salt → deploy hook → deploy wrapper → deploy factory → deploy token impl |
 
 ### Off-chain components
 
 | Component | Purpose |
 |-----------|---------|
-| `web/` (static frontend) | Vercel-hosted Web3 UI. Form for campaign params. Wallet connect via RainbowKit. Builds and signs single TX to `CampaignWrapper`. |
-| `web/lib/launchURL.ts` | URL builder for deep-linking individual campaigns + sharing on Twitter/Telegram |
-| (optional) `keeper/` | If using auto-harvest for tax distribution — Cloudflare Workers bot |
+| `web/` (static frontend) | Vercel-hosted Web3 UI. Form for campaign params + preset selector. Wallet connect via RainbowKit. Builds and signs single TX to `CampaignWrapper`. |
+| `web/lib/launchURL.ts` | URL builder for deep-linking + sharing on Twitter/Telegram |
+| `web/lib/presets.ts` | Pre-baked enable-flag combinations: Memecoin / Fair Launch / RWA / DAO / Custom |
+| (optional) `keeper/` | Auto-harvest for tax distribution (v2 / post-allowlist) — Cloudflare Workers bot |
 
 ### Tests
 
 | File | Purpose |
 |------|---------|
 | `test/CampaignWrapper.t.sol` | Atomic launch flow, edge cases (existing token vs new, native ETH vs ERC-20 pair) |
-| `test/TokenLaunchHook.t.sol` | Mechanism tests (anti-snipe, tax, lock, etc.) |
+| `test/TokenLaunchHook.integration.t.sol` | End-to-end: deploy + launch via wrapper + multi-mechanism interaction |
 | `test/TokenLaunchHook.governance.t.sol` | Governance NFT capture, mutability constraints, lifecycle phases |
 | `test/TokenLaunchHook.race.t.sol` | Anti-sandwich resistance (try to mint first as attacker) |
+| `test/mechanisms/AntiSnipeMechanism.t.sol` | Unit tests for M1 in isolation (mock hook fixture) |
+| `test/mechanisms/BuySellTaxMechanism.t.sol` | Unit tests for M2 |
+| `test/mechanisms/LiquidityLockMechanism.t.sol` | Unit tests for M3 |
+| `test/mechanisms/*.t.sol` | One file per mechanism for isolated unit testing |
 | `test/TokenFactory.t.sol` | Token deploy via clones, initialization correctness |
 | `test/TokenLaunchHook.fork.t.sol` | Mainnet fork tests against real PoolManager/PosM |
 
 ## Mechanisms — Design Specs
+
+> **Status:** the specs below are the **initial draft** captured before the modular-architecture refactor. Each mechanism will be **re-spec'd individually** in upcoming sessions to:
+> - Lock down exact storage layout (`<Name>Config` / `<Name>State` structs)
+> - Decide v1 vs v2 placement (some may be deferred or merged)
+> - Define module interface (init, predicates, governance setters, events)
+> - Capture variants and open questions
+>
+> See [Module catalog](#module-catalog-v1--planned-v2) for the current set with their v1/v2 designation. Refactor will follow the [Mechanism module template](#mechanism-module-template) shape.
 
 ### M1: Anti-Snipe Block-Window
 
@@ -635,8 +861,7 @@ function _beforeAddLiquidity(
         // Anti-sandwich: only deployer's wallet can do first mint
         require(tx.origin == cfg.deployer, "Wrong first LP");
         
-        // Capture governance NFT
-        // Salt convention in V4 PosM: salt = bytes32(tokenId) — VERIFY in PosM source
+        // Capture governance NFT via salt = bytes32(tokenId) convention (verified in PosM)
         state.config = cfg;
         state.governanceTokenId = uint256(params.salt);
         state.initialized = true;
@@ -687,16 +912,24 @@ Deployer signs EIP-712 message off-chain. Submitted via hookData. Hook recovers 
 
 The primary defense. Wrapper bundles `initializePool + modifyLiquidities` in one TX → no in-flight state for attackers to exploit. `msg.sender` is the wrapper, `tx.origin` is the human deployer.
 
-### Salt = tokenId convention
+### Salt = tokenId convention ✅ VERIFIED
 
-For NFT capture to work, V4 PositionManager **must** use `salt = bytes32(tokenId)` when calling `PoolManager.modifyLiquidity`. **VERIFY** in `lib/v4-hooks-public/lib/v4-periphery/src/PositionManager.sol` source before relying on it.
+Verified in `lib/v4-hooks-public/lib/v4-periphery/src/PositionManager.sol`. **All** liquidity actions pass `salt = bytes32(tokenId)` to `poolManager.modifyLiquidity`:
 
-If different, alternative capture mechanisms:
-- Listen to `Transfer(address(0), recipient, tokenId)` event off-chain → call `hook.designateGovernance(pid, tokenId)` from authorized address
-- Use `subscribe(tokenId, hook, "")` from wrapper immediately after mint; hook captures tokenId from `notifySubscribe`
-- Wrapper reads `PosM.nextTokenId()` before mint, predicts tokenId, passes via hookData (fragile — race with other PosM users)
+| Action | PositionManager.sol line | Salt value |
+|--------|--------------------------|------------|
+| `_mint` (MINT_POSITION) | 379 | `bytes32(tokenId)` |
+| `_increase` | 298 | `bytes32(tokenId)` |
+| `_decrease` | 343 | `bytes32(tokenId)` |
+| `_burn` | 431 | `bytes32(tokenId)` |
+| `_increaseFromDeltas` | 326 | `bytes32(tokenId)` |
 
-**Recommendation: verify salt convention as priority #1 before coding.**
+So `uint256(params.salt)` in our hook callbacks reliably gives the corresponding NFT tokenId. Capture logic works as designed; no fallback mechanisms needed.
+
+**Bonus:** `nextTokenId` is a public state variable on PositionManager — readable off-chain by our Web3 UI before signing TX. Useful for:
+- Pre-rendering NFT preview ("your order will be #1247")
+- Sandwich-detection (verify `nextTokenId` didn't shift between TX preparation and submission)
+- Anti-griefing checks inside `CampaignWrapper`
 
 ### LP NFT recipient flexibility
 
@@ -851,10 +1084,10 @@ Hooks.Permissions({
    - ECDSA signature in hookData works under any wallet
    - **Recommendation: `tx.origin` for v1 (most launchers use Metamask EOA); ECDSA for v2.**
 
-4. **First-LP capture: `salt = tokenId` convention assumption:**
-   - PosM source must use `salt = bytes32(tokenId)` for hook to read tokenId
-   - **Highest priority: verify in `lib/v4-hooks-public/lib/v4-periphery/src/PositionManager.sol` BEFORE coding.**
-   - If different, fallback: `subscribe()` + `notifySubscribe` callback to record tokenId
+4. **First-LP capture: `salt = tokenId` convention** ✅ RESOLVED
+   - **Verified** in PosM source (line 379 for mint, similar for increase/decrease/burn): all liquidity actions pass `salt = bytes32(tokenId)`
+   - Hook reads `uint256(params.salt)` to get tokenId — reliable
+   - No fallback needed
 
 5. **Multi-position first-LP edge case:**
    - If deployer mints multiple positions in same multicall, which becomes governance?
@@ -905,7 +1138,7 @@ Hooks.Permissions({
 | Governance NFT lost/burned mid-launch | 🟡 Medium | Hook blocks burn in Phase 1 via `_beforeRemoveLiquidity` |
 | AA wallets break `tx.origin` checks | 🟡 Medium | ECDSA signature pattern in v2; document v1 limitation |
 | Tax logic gas cost makes small swaps uneconomical | 🟡 Medium | Optimize gas; consider waiver for swaps below threshold |
-| `salt = tokenId` convention assumption wrong | 🟡 Medium | **Verify in PosM source BEFORE coding**; fallback via subscribe |
+| `salt = tokenId` convention assumption wrong | 🟢 Low | **VERIFIED in PosM source** (lines 298/343/379/431 — all use `bytes32(tokenId)`); risk only if PosM updates this convention in future release |
 | `tx.origin == cfg.deployer` fails if deployer uses Safe | 🟡 Medium | Detect at wrapper level; offer ECDSA path or warn user |
 | Cross-pool storage contamination if PoolId computed wrong | 🟡 Medium | Use canonical `key.toId()`; test edge cases |
 | Competition from PinkSale/DxSale moves to V4 | 🟡 Medium | First-mover advantage; better tech moat |
@@ -1046,21 +1279,24 @@ Test against live Uniswap V4 PoolManager on Base.
 
 | Phase | Duration | Deliverable |
 |-------|----------|-------------|
-| **Pre-coding research** | 1 week | Verify salt convention; salt mining feasibility; Uniswap allowlist process |
-| **Spec finalization** | 1 week | Interfaces locked; deploy script outlined; UI mockups |
-| **Core contracts: hook + wrapper + factory** | 6 weeks | M1-M3 implemented; CampaignWrapper full; TokenFactory; 90% test coverage |
-| **Extended mechanisms** | 3 weeks | M4-M6 implemented |
-| **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form; wallet connect; deep links |
-| **Submit Uniswap allowlist application** | — | Parallel with audit; whenever code is testable |
-| **Audit** | 4-6 weeks | External audit of hook + wrapper + factory (~$80K); fixes; bug bounty |
+| **Pre-coding research** | 1 week | ~~Verify salt convention~~ ✅; salt mining feasibility; Uniswap allowlist process |
+| **Architectural spec lock** | 1 week | Modular structure agreed; main hook skeleton + module template proven |
+| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each module (M1, M2, M3, M5, M9, M10, M11, M12, M13, M14). Each: design doc + interface + open questions resolved |
+| **Mandatory modules** (M1-M3) + Governance + Wrapper | 5 weeks | Anti-snipe, tax, lock, governance NFT, atomic launch flow; 90% test coverage |
+| **Optional modules** (M5, M9-M14) | 3 weeks | Each module ~3-4 days incl. tests |
+| **Token deployment** (TokenFactory + StandardToken) | 1 week | Cheap ERC-20 clones; integration with Wrapper |
+| **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form with presets; wallet connect; deep links |
+| **Submit Uniswap allowlist application** | — | Parallel with audit; once code is testable on testnet |
+| **Audit** | 4-6 weeks | External audit of hook + wrapper + factory + each module (~$80K); fixes; bug bounty |
 | **Testnet launch + beta** | 4 weeks | Base Sepolia + Unichain Sepolia; 3-5 beta launches with friendly projects |
-| **Mainnet** | — | Deploy on Base/Unichain (cheap), Arbitrum (good liquidity), Mainnet (last) |
+| **Mainnet** | — | Deploy on Base/Unichain first (cheap), Arbitrum (good liquidity), Mainnet last |
+| **(v2)** Custom-accounting modules | TBD | M8 (Treasury), M6 (Bonding curve), M7 (Auto-buyback) after allowlist secured |
 
-**Total to mainnet: ~5-6 months.** Uniswap allowlist may resolve in parallel or post-mainnet (Phase A/B fallback handles either).
+**Total to v1 mainnet: ~5-6 months.** Uniswap allowlist may resolve in parallel or post-mainnet (Phase A/B fallback handles either).
 
 ## Open Questions for Future Sessions
 
-1. **VERIFY: `salt = bytes32(tokenId)` in V4 PositionManager** — read `lib/v4-hooks-public/lib/v4-periphery/src/PositionManager.sol`, confirm. If different, redesign capture via subscribe-callback. *🔴 Highest priority before coding — blocks the whole governance model.*
+1. ~~**VERIFY: `salt = bytes32(tokenId)` in V4 PositionManager**~~ ✅ **RESOLVED** — verified in PosM source (lines 298, 343, 379, 431). All liquidity actions use `bytes32(tokenId)` as salt. `nextTokenId` is publicly readable for off-chain prediction.
 
 2. **Uniswap allowlist process research**:
    - What's the application form URL and required materials?
@@ -1098,3 +1334,20 @@ Test against live Uniswap V4 PoolManager on Base.
 13. **Web3 UI tech stack**: Next.js + RainbowKit + Wagmi (standard) vs more specialized memecoin-launch-UX patterns. Out-of-scope for hook architecture but blocks user-facing product.
 
 14. **Sandwich resistance for dynamic tax** (post-allowlist): tax changing within block can be exploited; add commit-reveal or rate limiting?
+
+15. **Module-by-module spec drilling**: each mechanism in [Module catalog](#module-catalog-v1--planned-v2) needs its own deep-dive session. Open spec questions per module include:
+    - Exact storage struct layout (immutable vs mutable fields)
+    - Hook callback invocation order (which module runs first?)
+    - Governance setter scope (which params mutable, monotone bounds)
+    - Cross-module interactions (e.g., does M13 SniperBlacklist deny M2 tax? Or apply tax + blacklist sell separately?)
+    - Per-module test fixtures (mock hook for isolated unit tests)
+
+16. **EnabledMechanisms storage** — bit-packed `uint16` vs explicit `struct` with `bool` fields? Bit-pack saves slot but harder to read; explicit struct uses 1 slot anyway if fits in 32 bytes.
+
+17. **Module ordering in inheritance** — Solidity C3 linearization can produce surprises. Pin the order in `TokenLaunchHook` declaration and verify with tests.
+
+18. **Mechanism interaction examples to decide ahead of coding:**
+    - Whitelist (M5) + Anti-snipe (M1): both might revert. Order? Likely whitelist first (gas cheaper if not allowed).
+    - Auto-burn (M11) + Tax (M2): burn % comes off post-tax or pre-tax volume?
+    - Insider (M12) + Tax (M2): does insider rule override the tax decay schedule?
+    - Sniper blacklist (M13) + Lock (M3): if blacklisted seller can't sell but tries to remove liquidity, what happens?
