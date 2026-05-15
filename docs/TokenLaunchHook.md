@@ -1414,6 +1414,259 @@ test_postLaunchEnd_setOverride_reverts                   (LaunchEnded)
 - **Override mechanics**: setting `setBuyTaxOverride(5_000)` while decay is at 8% → effective drops to 5% immediately. If decay later naturally reaches 3%, effective continues to drop to 3% (min wins). Override doesn't "freeze" tax — it caps it.
 - **Stateless module**: `_currentTax` is `internal view`. No SSTOREs in `_beforeSwap`. Only SLOADs.
 
+## M3 LiquidityLockMechanism — Finalized Spec
+
+### Purpose
+
+Provides **conditional unlock** for the governance NFT (deployer's seed LP). Extends GovernanceModule's simple time-based burn protection (`launchEndTime` from G3) with richer criteria: cumulative volume threshold, combined logic.
+
+**Relationship with Governance burn protection (G3):**
+- Governance G3: blocks `decreaseLiquidity` / `burn` of gov NFT until `launchEndTime` — **always applies** (whether M3 enabled or not)
+- M3: **additional** check on top — when enabled, both conditions must pass
+
+Result: `launchEndTime` is the **minimum lock duration**, M3 extends it with stricter requirements.
+
+**Scope (v1):** M3 applies ONLY to governance NFT (L8). Other LP NFTs (joining after launch) are free to add/remove anytime. Avoids overly-restrictive UX for retail LPs.
+
+### Design decisions (L1-L13 locked)
+
+| # | Decision |
+|---|----------|
+| L1 | v1 supports TIME + VOLUME conditions; HOLDERS and PRICE_FLOOR deferred to v2 |
+| L2 | Logic mode (AND / OR) selectable at bootstrap |
+| L3 | Mutability: time/volume thresholds only DECREASE; conditions can DISABLE; AND→OR one-way |
+| L4 | At least one condition must remain enabled at all times |
+| L5 | Volume tracked every swap (no threshold) |
+| L6 | Total bidirectional volume (both buys and sells contribute) |
+| L7 | Volume measured in pair-currency units (e.g., WETH wei) |
+| L8 | M3 applies only to governance NFT in v1; other LP NFTs unrestricted |
+| L9 | M3 conditions are AND with Governance G3: `unlockAllowed = launchEnded AND m3Met` |
+| L10 | No reachability check on volume threshold (deployer's responsibility) |
+| L11 | `unlockTime >= launchEndTime` enforced at init |
+| L12 | Cumulative volume never reset (lifetime pool metric) |
+| L13 | Verbose events (relax/disable/switch) for indexer consumption |
+
+### Configuration (2 slots per pool)
+
+```solidity
+enum UnlockLogic { AND, OR }
+
+struct LiquidityLockConfig {
+    UnlockLogic logic;              // 1 byte
+    bool timeEnabled;               // 1 byte
+    bool volumeEnabled;             // 1 byte
+    uint64 unlockTime;              // 8 bytes (must be >= launchEndTime at init)
+    uint128 unlockVolumeThreshold;  // 16 bytes (pair-currency wei)
+    // Total: 27 bytes → fits in 1 slot ✓
+}
+
+struct LiquidityLockState {
+    uint128 cumulativeVolume;       // 16 bytes — accumulated pair-side, lifetime
+}
+
+mapping(PoolId => LiquidityLockConfig) internal _lockConfigs;
+mapping(PoolId => LiquidityLockState) internal _lockStates;
+```
+
+### Volume tracking (in `_afterSwap`)
+
+```solidity
+function _trackVolume(PoolId pid, BalanceDelta delta, bool tokenIsCurrency0) internal {
+    int128 pairAmount = tokenIsCurrency0 ? delta.amount1() : delta.amount0();
+    uint128 absVol = uint128(uint256(int256(pairAmount < 0 ? -pairAmount : pairAmount)));
+    _lockStates[pid].cumulativeVolume += absVol;
+}
+```
+
+Volume = sum of absolute pair-currency deltas across all swaps (L5, L6, L7). Both buys and sells contribute. Pair-side measurement makes thresholds comparable across launches (deployer specifies in WETH wei).
+
+### Unlock check
+
+```solidity
+function _isUnlocked(PoolId pid) internal view returns (bool) {
+    LiquidityLockConfig storage cfg = _lockConfigs[pid];
+    LiquidityLockState storage state = _lockStates[pid];
+    
+    bool timeOk = !cfg.timeEnabled || block.timestamp >= cfg.unlockTime;
+    bool volumeOk = !cfg.volumeEnabled || state.cumulativeVolume >= cfg.unlockVolumeThreshold;
+    
+    if (cfg.logic == UnlockLogic.AND) {
+        return timeOk && volumeOk;
+    } else {
+        // OR: at least one ENABLED condition must be met
+        return (cfg.timeEnabled && timeOk) || (cfg.volumeEnabled && volumeOk);
+    }
+}
+```
+
+### Skeleton
+
+```solidity
+abstract contract LiquidityLockMechanism {
+    mapping(PoolId => LiquidityLockConfig) internal _lockConfigs;
+    mapping(PoolId => LiquidityLockState) internal _lockStates;
+    
+    error NoConditionsEnabled();
+    error UnlockTimeBeforeLaunchEnd();
+    error CanOnlyRelax();
+    error MustKeepOneCondition();
+    error LiquidityStillLocked();
+    error AlreadyOr();
+    
+    event LiquidityLockInitialized(PoolId indexed pid, LiquidityLockConfig cfg);
+    event UnlockTimeRelaxed(PoolId indexed pid, uint64 oldTime, uint64 newTime);
+    event UnlockVolumeRelaxed(PoolId indexed pid, uint128 oldVol, uint128 newVol);
+    event ConditionDisabled(PoolId indexed pid, bool wasTime);
+    event LogicSwitchedToOr(PoolId indexed pid);
+    
+    function _initLock(PoolId pid, LiquidityLockConfig memory cfg, uint64 launchEndTime) internal {
+        if (!cfg.timeEnabled && !cfg.volumeEnabled) revert NoConditionsEnabled();       // L4
+        if (cfg.timeEnabled && cfg.unlockTime < launchEndTime) revert UnlockTimeBeforeLaunchEnd(); // L11
+        if (cfg.volumeEnabled && cfg.unlockVolumeThreshold == 0) revert NoConditionsEnabled();
+        _lockConfigs[pid] = cfg;
+        emit LiquidityLockInitialized(pid, cfg);
+    }
+    
+    function _checkLiquidityLock(PoolId pid) internal view {
+        if (!_isUnlocked(pid)) revert LiquidityStillLocked();
+    }
+    
+    function _trackVolume(PoolId pid, BalanceDelta delta, bool tokenIsCurrency0) internal {
+        int128 pairAmount = tokenIsCurrency0 ? delta.amount1() : delta.amount0();
+        uint128 absVol = uint128(uint256(int256(pairAmount < 0 ? -pairAmount : pairAmount)));
+        _lockStates[pid].cumulativeVolume += absVol;
+    }
+    
+    // ─── Governance setters (one-way relaxation per L3) ───
+    
+    function relaxUnlockTime(PoolId pid, uint64 newTime) external onlyGovernance(pid) {
+        LiquidityLockConfig storage cfg = _lockConfigs[pid];
+        if (!cfg.timeEnabled) revert NoConditionsEnabled();
+        if (newTime >= cfg.unlockTime) revert CanOnlyRelax();
+        uint64 old = cfg.unlockTime;
+        cfg.unlockTime = newTime;
+        emit UnlockTimeRelaxed(pid, old, newTime);
+    }
+    
+    function relaxUnlockVolume(PoolId pid, uint128 newVol) external onlyGovernance(pid) {
+        LiquidityLockConfig storage cfg = _lockConfigs[pid];
+        if (!cfg.volumeEnabled) revert NoConditionsEnabled();
+        if (newVol >= cfg.unlockVolumeThreshold) revert CanOnlyRelax();
+        if (newVol == 0) revert NoConditionsEnabled();  // use disableVolumeCondition instead
+        uint128 old = cfg.unlockVolumeThreshold;
+        cfg.unlockVolumeThreshold = newVol;
+        emit UnlockVolumeRelaxed(pid, old, newVol);
+    }
+    
+    function disableTimeCondition(PoolId pid) external onlyGovernance(pid) {
+        LiquidityLockConfig storage cfg = _lockConfigs[pid];
+        if (!cfg.timeEnabled) revert NoConditionsEnabled();
+        if (!cfg.volumeEnabled) revert MustKeepOneCondition();  // L4
+        cfg.timeEnabled = false;
+        emit ConditionDisabled(pid, true);
+    }
+    
+    function disableVolumeCondition(PoolId pid) external onlyGovernance(pid) {
+        LiquidityLockConfig storage cfg = _lockConfigs[pid];
+        if (!cfg.volumeEnabled) revert NoConditionsEnabled();
+        if (!cfg.timeEnabled) revert MustKeepOneCondition();
+        cfg.volumeEnabled = false;
+        emit ConditionDisabled(pid, false);
+    }
+    
+    function switchToOr(PoolId pid) external onlyGovernance(pid) {
+        LiquidityLockConfig storage cfg = _lockConfigs[pid];
+        if (cfg.logic == UnlockLogic.OR) revert AlreadyOr();
+        cfg.logic = UnlockLogic.OR;
+        emit LogicSwitchedToOr(pid);
+    }
+    
+    // Views
+    function lockConfigOf(PoolId pid) external view returns (LiquidityLockConfig memory) {
+        return _lockConfigs[pid];
+    }
+    
+    function cumulativeVolumeOf(PoolId pid) external view returns (uint128) {
+        return _lockStates[pid].cumulativeVolume;
+    }
+    
+    function isUnlocked(PoolId pid) external view returns (bool) {
+        return _isUnlocked(pid);
+    }
+}
+```
+
+### Integration in main hook
+
+```solidity
+// _beforeRemoveLiquidity
+function _beforeRemoveLiquidity(
+    address /*sender*/,
+    PoolKey calldata key,
+    ModifyLiquidityParams calldata params,
+    bytes calldata
+) internal override returns (bytes4) {
+    PoolId pid = key.toId();
+    GovernanceState storage gov = _governance[pid];
+    
+    if (uint256(params.salt) == gov.tokenId) {       // L8: only gov NFT
+        _checkBurnProtection(pid, params);            // Governance G3 — always
+        if (enabled[pid].lock) {
+            _checkLiquidityLock(pid);                 // M3 — when enabled (L9: AND with G3)
+        }
+    }
+    return this.beforeRemoveLiquidity.selector;
+}
+
+// _afterSwap
+function _afterSwap(
+    address /*sender*/,
+    PoolKey calldata key,
+    SwapParams calldata /*params*/,
+    BalanceDelta delta,
+    bytes calldata
+) internal override returns (bytes4, int128) {
+    PoolId pid = key.toId();
+    if (enabled[pid].lock) {
+        _trackVolume(pid, delta, _governance[pid].tokenIsCurrency0);
+    }
+    return (this.afterSwap.selector, 0);
+}
+```
+
+### Test cases (18 tests in `test/mechanisms/LiquidityLockMechanism.t.sol`)
+
+```
+test_init_storesConfig_emitsEvent
+test_init_noConditions_reverts                       (NoConditionsEnabled)
+test_init_unlockTimeBeforeLaunchEnd_reverts          (UnlockTimeBeforeLaunchEnd)
+test_init_volumeEnabledZeroThreshold_reverts         (NoConditionsEnabled)
+test_volumeAccumulates_inAfterSwap_bothDirections
+test_isUnlocked_AND_bothMet_returnsTrue
+test_isUnlocked_AND_oneMet_returnsFalse
+test_isUnlocked_OR_eitherMet_returnsTrue
+test_isUnlocked_neitherMet_returnsFalse
+test_removeLiquidity_locked_reverts                  (LiquidityStillLocked)
+test_removeLiquidity_unlocked_succeeds
+test_removeLiquidity_beforeLaunchEnd_reverts         (Governance G3, even if M3 met)
+test_relaxUnlockTime_byOwner_succeeds_emitsEvent
+test_relaxUnlockTime_higherThanCurrent_reverts       (CanOnlyRelax)
+test_relaxUnlockVolume_byOwner_succeeds
+test_disableTimeCondition_keepsVolumeActive
+test_disableLastCondition_reverts                    (MustKeepOneCondition)
+test_switchToOr_changesLogic_emitsEvent
+test_switchToOr_alreadyOr_reverts                    (AlreadyOr)
+test_nonGovNFT_removeLiquidity_unrestricted          (L8)
+```
+
+### Edge cases / notes
+
+- **Volume accumulation overflow**: `uint128` ceiling = ~3.4 × 10³⁸ wei = ~3.4 × 10²⁰ ETH. Effectively unlimited for any realistic launch. SafeMath not needed.
+- **Cumulative metric**: volume never resets, even after unlock. Allows tracking lifetime activity for analytics.
+- **AND→OR one-way ratchet**: gov cannot tighten by reverting OR→AND. Once relaxed, stays relaxed.
+- **Edge case: relax to current `block.timestamp`**: `newTime < cfg.unlockTime` allows setting to `block.timestamp - 1`, effectively "unlock now if other conditions met". Useful for emergency unlock.
+- **No "reachability check" on volumeThreshold (L10)**: deployer could set `unlockVolumeThreshold = type(uint128).max` → effectively never unlocks via volume. That's their choice; gov can lower if mistake.
+
 ## Parameter Mutability & Lifecycle Phases
 
 ### Mutability matrix
