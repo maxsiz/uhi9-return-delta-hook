@@ -1,69 +1,26 @@
-# TokenLaunchHook — V4 Hook for Fair Token Launches
+# TokenLaunchHook — Coding Spec
 
-> **Status:** Architecture draft. Not implemented.
-> **Next:** Resolve open design questions, deploy testnet skeleton with minimal mechanism set.
+> **Status:** Architecture finalized. Ready for implementation.
+> v1 scope: 5 modules — GovernanceModule, M1 AntiSnipe, M2 BuySellTax, M3 LiquidityLock (mandatory) + M5 WhitelistPhase (optional).
 
-## Concept
-
-A V4 hook attached to the pool of a newly launched token. The hook enforces fair-launch rules: anti-snipe, buy/sell tax, liquidity locking with conditional unlocks, whitelist phases, and bonding-curve fallback. Replaces today's kludgy "ERC-20 with tax logic baked in" pattern with a clean separation: standard ERC-20 + dedicated launch-economics hook on the pool.
-
-## Value Proposition
-
-**For project creators:**
-- Standard ERC-20 (no custom tax logic in token) → easier CEX listing later
-- Composable mechanisms (anti-snipe + tax + lock + whitelist) configurable per launch
-- Liquidity lock is **technically enforced** (rug pulls become impossible by code, not just by trust)
-- Multi-mechanism single deploy: configure via hook params instead of multiple tools
-
-**For traders/holders:**
-- Fair access (snipers can't loot the first block)
-- Price floor support via sell-tax → buyback mechanism
-- Protection against rug pull (LP locked until objective conditions met)
-
-**For us (the protocol):**
-- Per-launch fee (e.g., 0.5% of seed liquidity)
-- Continuous fee from swap tax allocation
-- Memecoin sector revenue: $200M+/year on EVM, mostly captured by V3-era tools
-
-## Why V4 Hook is the Right Fit
-
-| Mechanism | Today's approach | V4 hook approach |
-|-----------|-------------------|------------------|
-| Buy/sell tax | Embedded in ERC-20 token (rigid, breaks composability) | In pool hook (token stays clean) |
-| Anti-snipe | Off-chain via launchpad UI (centralized, gameable) | On-chain in `_beforeSwap` (trustless) |
-| LP lock | Separate timelock contract (rigid time-based only) | Hook-driven (volume/holder/price conditions) |
-| Whitelist | Token-level allowlist (cross-protocol breakage) | Per-pool restriction (clean separation) |
-| Bonding curve | Separate ICO contract | Built into hook's swap routing |
-
-V4's hook architecture is **purpose-built** for this. Cleaner than every existing alternative.
+V4 hook attached to a newly launched token's pool. Enforces fair-launch rules (anti-snipe, dynamic LP fee tax, conditional liquidity lock, whitelist phase) without modifying the ERC-20 token contract. Single hook deployment per chain serves all launches.
 
 ## Architecture Overview
 
-```
-Project deploys:
-  1. Token contract (standard ERC-20, no special logic)
-  2. TokenLaunchHook (with config: anti-snipe blocks, tax rates, lock condition)
-  3. Pool: PoolKey(NEWTOKEN, WETH, fee=dynamic, tickSpacing=60, hooks=TokenLaunchHook)
-  4. Initial liquidity → LP NFT locked to LiquidityLock contract
+Three on-chain components deployed **once per chain**:
+- `TokenLaunchHook` — single shared hook, all launches use it
+- `CampaignWrapper` — non-upgradeable coordinator; entry point from Web3 UI
+- `TokenFactory` (+ `StandardToken` impl) — optional ERC-20 cloner
 
-Launch goes live (block 0):
-  - First N blocks: hook enforces max buy size + rate limits
-  - Tax mechanism active on every swap
-  - LP NFT locked until condition met
+Per launch (one atomic TX via `CampaignWrapper.launchCampaign`):
+1. Optionally deploy ERC-20 via `TokenFactory` (or BYO existing token)
+2. `PositionManager.multicall([initializePool, modifyLiquidities([MINT_POSITION])])` with `hookData` carrying module configs
+3. Hook's `_beforeAddLiquidity` (first call per pool) decodes hookData, captures governance NFT via `salt = bytes32(tokenId)` convention
+4. Subsequent swaps trigger enabled modules: anti-snipe check, dynamic LP fee from tax decay, etc.
+5. Governance NFT owner can relax mutable params (lower taxes, shorten lock, add to whitelist)
+6. At `launchEndTime`, governance phase freezes; M3 unlock conditions determine when LP can exit
 
-Time passes:
-  - Hook tracks: volume, unique holders, time, price history
-  - Each swap: _beforeSwap (validation, tax) + _afterSwap (event recording)
-
-Unlock conditions met:
-  - LiquidityLock allows LP withdrawal
-  - Or graceful transition: lock partially decays over time
-
-Mature launch:
-  - Tax rates decay to minimal
-  - Anti-snipe windows long past
-  - Pool operates as normal V4 pool
-```
+State lives in `mapping(PoolId => ...)` per module — single hook serves many concurrent launches.
 
 ## Deployment Architecture: Single Hook + CampaignWrapper
 
@@ -393,29 +350,9 @@ Per chain (Mainnet, Unichain, Base, Arbitrum), deploy:
 
 **After setup:** every new launch costs only the storage-write gas in `_beforeAddLiquidity` plus the standard `MINT_POSITION` cost — no extra contract deploys.
 
-### Allowlist strategy
+### Non-upgradeable design
 
-1. **Submit `TokenLaunchHook` address for Uniswap allowlist** (the only hook address ever used)
-2. While waiting, all launches still work — pool creation goes through `CampaignWrapper` directly, not Uniswap UI
-3. Once allowlisted: trades through Uniswap UI route to our pools automatically — no per-launch friction
-4. Until allowlisted: traders use **1inch, 0x, ParaSwap** (aggregators don't require Uniswap allowlist), or our own swap UI
-
-Allowlist is a **nice-to-have, not a blocker**. See "Fallback Distribution Strategy" below.
-
-### Why non-upgradeable
-
-`CampaignWrapper` and `TokenLaunchHook` are both deployed **without admin / proxy / upgrade mechanism**. If we need a new version:
-- Deploy `CampaignWrapper_v2` at new address; UI swaps to it
-- Deploy `TokenLaunchHook_v2`; submit new allowlist application; future launches use it
-- Old `_v1` keeps running for existing launches forever (no forced migration)
-
-This eliminates:
-- Admin key risk
-- Proxy upgrade exploits
-- Storage-collision bugs from upgrades
-- Trust issues for users ("can the deployer drain my pool?")
-
-The price: a hook bug found post-deploy means migrate-or-live-with-it. Mitigated via thorough audit + bug bounty pre-launch.
+Both `CampaignWrapper` and `TokenLaunchHook` are deployed without admin / proxy / upgrade mechanism. New versions deploy at new addresses; old versions keep running for existing launches. Eliminates admin key risk, proxy upgrade exploits, storage-collision bugs. Hook bugs require migration to new deployment.
 
 ## Modular Mechanism Architecture
 
@@ -547,15 +484,6 @@ abstract contract <Name>Mechanism {
     event <Name>ParamUpdated(PoolId indexed pid, string param, bytes newValue);
 }
 ```
-
-### Why not external plugins / dynamic dispatch
-
-We considered:
-- **External plugin contracts** with `IMechanismPlugin` interface — rejected because external calls cost gas, security review per plugin needed, reentrancy concerns.
-- **Library pattern** (stateless libs, storage in hook) — rejected because it doesn't give true encapsulation; main hook ends up with all state declarations directly.
-- **Solidity Diamond standard (EIP-2535)** — rejected as overkill for non-upgradeable contract.
-
-Abstract inheritance is the **right level of modularity** for our problem: code organization + isolated testing + audit-friendly boundaries, with zero runtime overhead.
 
 ### Module catalog (v1 + planned v2)
 
@@ -892,17 +820,6 @@ test_launchPhaseOf_returnsCorrectPhase
 test_multiplePositionsFirstMulticall_onlyFirstCapturesGov
 ```
 
-### Front-running considerations
-
-The atomic `CampaignWrapper.launchCampaign` flow means **no race window WITHIN the TX**: init + first mint are bundled, no actor can intervene mid-multicall.
-
-However, **the wrapper call itself** can be front-run from mempool:
-- Attacker sees pending `launchCampaign(params)` 
-- Submits competing call with same params + higher gas
-- Attacker becomes deployer of "their version" of the launch
-
-**Mitigation:** this is grief, not theft. Attacker pays full seed liquidity for their own launch with their own (cloned) token. Original deployer can either (a) launch on slightly different PoolKey (different `tickSpacing`/`fee`), or (b) use private mempool (Flashbots) / commit-reveal pattern for high-value launches. Documented as known limitation; v2 may add commit-reveal scheme.
-
 ### Salt = tokenId convention ✅ VERIFIED
 
 Verified in `lib/v4-hooks-public/lib/v4-periphery/src/PositionManager.sol`. **All** liquidity actions pass `salt = bytes32(tokenId)` to `poolManager.modifyLiquidity`:
@@ -922,15 +839,9 @@ So `uint256(params.salt)` in our hook callbacks reliably gives the corresponding
 - Sandwich-detection (verify `nextTokenId` didn't shift between TX preparation and submission)
 - Anti-griefing checks inside `CampaignWrapper`
 
-### LP NFT recipient flexibility
+### LP NFT recipient
 
-`CampaignParams.lpRecipient` lets the deployer choose who receives the governance NFT:
-- Deployer themselves (default)
-- A multisig (Safe) for team-controlled launches
-- A DAO governance contract for community-controlled launches
-- A timelock contract for additional rug-pull protection
-
-The hook only checks **ownership** of the gov NFT — not who minted it. So transferring/holding via any of the above works seamlessly. The recipient address is passed as `recipient` argument inside the `MINT_POSITION` action.
+`CampaignParams.lpRecipient` (passed as `recipient` in `MINT_POSITION` action) determines who receives the governance NFT. Can be deployer EOA, Safe multisig, DAO governance contract, or timelock. The hook only checks NFT ownership, not who minted it.
 
 ## M1 AntiSnipeMechanism — Finalized Spec
 
@@ -1752,104 +1663,21 @@ test_relaxEndTime_laterThanCurrent_reverts               (CanOnlyRelax)
 - **W11 rationale**: removing liquidity is asset withdrawal. Blocking it could trap user funds. Even if a user gets removed from whitelist (after adding liquidity earlier), they can still exit. M3 LiquidityLock separately protects the governance NFT — that's deployer's own LP, not third-party LPs.
 - **Bootstrap multicall order**: in `CampaignWrapper.launchCampaign`, after governance bootstrap completes, the wrapper can immediately call `addManyToWhitelist` for the initial KYC list — all in same atomic launch TX.
 
-## Parameter Mutability & Lifecycle Phases
-
-### Mutability matrix
-
-Principle: governance may only **reduce risk for holders**. Cannot make conditions worse.
-
-| Parameter | Mutable by gov? | Direction allowed |
-|-----------|------------------|--------------------|
-| `launchTime` | ❌ immutable | — |
-| `antiSnipeBlocks` | ❌ immutable | — |
-| `tokenAddress` | ❌ immutable | — |
-| `expectedFirstLP` | ❌ immutable | — |
-| `expectedInitialSqrtPrice` | ❌ immutable | — |
-| `launchEndTime` | ❌ immutable | — |
-| `buyTaxBps` | ✅ | Only DECREASE |
-| `sellTaxBps` | ✅ | Only DECREASE |
-| `baseTaxBps` | ❌ immutable | — |
-| `taxDecayPeriod` | ✅ | Only DECREASE (faster decay) |
-| `unlockMode` | ❌ immutable | — |
-| `unlockTime` | ✅ | Only EXTEND |
-| `unlockVolumeThreshold` | ✅ | Only DECREASE |
-| `unlockHolderThreshold` | ✅ | Only DECREASE |
-| `priceFloor` | ✅ | Only DECREASE |
-| `taxDistributionSplits` | ✅ | Bounded change (e.g., treasury % can only decrease) |
-
-### Lifecycle phases
-
-| Phase | Window | Governance status | Burn governance NFT? |
-|-------|--------|---------------------|------------------------|
-| **0: Pre-launch** | Before `CampaignWrapper.launchCampaign` | n/a | n/a |
-| **1: Launch active** | `0 → launchEndTime` | NFT owner can adjust mutable params | ❌ Hook blocks burn in `_beforeRemoveLiquidity` |
-| **2: Frozen post-launch** | `launchEndTime → ∞` | All setters revert; params frozen | ✅ Can burn freely (becomes normal LP NFT) |
-| **3: Governance NFT burned** | After phase 2 burn | Forever frozen | n/a |
-
-In Phase 1, governance NFT cannot be burned even at zero liquidity:
-
-```solidity
-function _beforeRemoveLiquidity(
-    address sender, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata
-) internal override returns (bytes4) {
-    PoolId pid = key.toId();
-    CampaignState storage state = campaigns[pid];
-    if (
-        uint256(params.salt) == state.governanceTokenId 
-        && block.timestamp < state.config.launchEndTime
-    ) {
-        revert("Cannot burn governance NFT during launch");
-    }
-    // ... LP lock checks for other positions
-    return this.beforeRemoveLiquidity.selector;
-}
-```
-
-This **forces the deployer's skin in the game** until launch completes — they can't pull their seed liquidity early.
-
-### Transferability of governance
-
-Governance NFT is a **standard ERC-721**. The owner can:
-- Transfer to a multisig (Safe) — recommended for serious launches
-- Transfer to a DAO governance contract
-- Sell on NFT marketplace (rare but possible)
-- Hold themselves
-
-`CampaignParams.lpRecipient` lets deployer set the initial holder directly at launch — no separate transfer step needed. Common patterns:
-- Self (default): `lpRecipient = msg.sender`
-- Team multisig: `lpRecipient = <Safe address>`
-- Timelock for extra rug protection: `lpRecipient = <Timelock address>`
-
-This makes the governance model **fluid** — projects can professionalize without redeploying the hook.
-
-### Multisig governance via NFT transfer (no delegation feature)
-
-Per **G6 decision: only NFT owner can call governance setters — always, no manager delegation feature even in v2.**
-
-If a project wants multisig governance:
-- **At launch**: set `CampaignParams.lpRecipient = <Safe address>`. NFT minted directly to the Safe.
-- **Mid-launch**: deployer transfers governance NFT to the Safe via `PositionManager.transferFrom`. New owner inherits full governance.
-
-This keeps the auth model **dead simple**: one address (or contract) owns the NFT, that address has governance. No additional delegation logic in the hook. Audit surface stays minimal.
-
-**Why no manager delegation:**
-- Adds storage + setter complexity to every module
-- Introduces "two paths to authority" — duplicate audit surface
-- ERC-721 transfer already provides the same composability (transfer to manager contract)
-- Stronger trust property: gov NFT owner = sole authority, no hidden delegated controllers
 
 ## Required Hook Permissions
 
 ```solidity
 Hooks.Permissions({
-    beforeInitialize: true,                       // validate pool config
-    afterInitialize: true,                        // set dynamic fee
-    beforeAddLiquidity: true,                     // restrict who can add (only project + LP lock)
-    beforeRemoveLiquidity: true,                  // route through LiquidityLock
-    beforeSwap: true,                             // anti-snipe + tax + whitelist
-    afterSwap: true,                              // tax distribution + state tracking
-    beforeSwapReturnDelta: true,                  // dynamic tax / bonding curve
-    afterSwapReturnDelta: true,                   // redirect tax to treasury
+    beforeInitialize: true,                       // no-op (V4 enforces first-init-wins)
+    afterInitialize: false,
+    beforeAddLiquidity: true,                     // bootstrap + whitelist + sniper checks
+    afterAddLiquidity: false,
+    beforeRemoveLiquidity: true,                  // governance burn protection + M3 lock check
+    afterRemoveLiquidity: false,
+    beforeSwap: true,                             // anti-snipe + tax (fee override) + whitelist
+    afterSwap: true,                              // M3 volume tracking
+    beforeSwapReturnDelta: true,                  // v2: bonding curve fallback (M6)
+    afterSwapReturnDelta: true,                   // v2: treasury fee routing (M8) + auto-buyback (M7)
     afterAddLiquidityReturnDelta: false,
     afterRemoveLiquidityReturnDelta: false,
     beforeDonate: false,
@@ -1857,281 +1685,15 @@ Hooks.Permissions({
 });
 ```
 
+**Note:** v1 modules don't use `*ReturnDelta` at runtime, but flags are reserved at deploy for v2 modules (M6, M7, M8) to be added later without redeploying the hook.
+
 ## Reused Patterns
 
 - **`BaseHook`** (`lib/v4-hooks-public/src/base/BaseHook.sol`) — standard inheritance, **unchanged**. CREATE2 salt mining for `TokenLaunchHook` deploy address handles permission flag bits.
-- **OpenZeppelin `Clones`** (`@openzeppelin/contracts/proxy/Clones.sol`) — battle-tested EIP-1167. Used **only in `TokenFactory`** for cheap ERC-20 deploys (NOT for the hook itself).
-- **`Multicall_v4`** in PositionManager — atomic batching of `initializePool + modifyLiquidities`; forwards `msg.value` across calls
-- **`Permit2`** approval flow — pre-signed token approval, used inside `CampaignWrapper` for ERC-20 transfers
-- **Dynamic fee** via `LPFeeLibrary.DYNAMIC_FEE_FLAG` + per-swap fee in `_beforeSwap` return — pattern from `SelfLPDirect._afterInitialize`
-- **`BeforeSwapDelta`** sign conventions — same as in `InternalSwapPool`
-- **`CurrencySettler`** — for tax distribution settlement (when allowlist secured + custom accounting enabled)
-- **`StateLibrary`** — for reading pool state (slot0, position) inside callbacks
-- **`Hooks.isValidHookAddress`** — for verifying mined hook deploy address has correct flag bits
-
-## Open Design Decisions
-
-1. **Tax distribution recipient model:**
-   - Option A: hook auto-distributes via `afterSwapReturnDelta` (atomic but more gas + custom-accounting permission)
-   - Option B: tax goes to LP holders proportionally via dynamic fee (standard permission, simpler)
-   - Option C: hook accrues, separate `harvest()` keeper batches distribution
-   - **Recommendation: B for v1 if avoiding allowlist. A or C for v2 once allowlisted.**
-
-2. **Holder counting:**
-   - Exact count requires event indexing → off-chain
-   - Approximate via Bloom filter → on-chain but lossy
-   - Token contract's `balanceOf` snapshot → expensive
-   - **Recommendation: external `IHolderCounter` interface; projects can wire to subgraph or oracle.**
-
-3. **Anti-sandwich auth: `tx.origin` vs ECDSA signature:**
-   - `tx.origin` simple, works for EOA, breaks under EIP-7702 / ERC-4337 AA
-   - ECDSA signature in hookData works under any wallet
-   - **Recommendation: `tx.origin` for v1 (most launchers use Metamask EOA); ECDSA for v2.**
-
-4. **First-LP capture: `salt = tokenId` convention** ✅ RESOLVED
-   - **Verified** in PosM source (line 379 for mint, similar for increase/decrease/burn): all liquidity actions pass `salt = bytes32(tokenId)`
-   - Hook reads `uint256(params.salt)` to get tokenId — reliable
-   - No fallback needed
-
-5. **Multi-position first-LP edge case:**
-   - If deployer mints multiple positions in same multicall, which becomes governance?
-   - **Recommendation: first by order in multicall (state flag `state.initialized` ensures only first triggers capture).**
-
-6. **Token deploy: inside wrapper or separate?**
-   - **A. Inside wrapper** (via `TokenFactory` minimal proxy): one-stop-shop, atomic
-   - **B. Separate step**: deployer brings existing token
-   - **Recommendation: support both via `params.existingToken == 0 ? deploy : use`.** UI defaults to "new" but allows "existing".
-
-7. **Composability with subscribe:**
-   - Project's LP NFT could subscribe to LaunchHook for analytics
-   - Hook can emit standardized "Volume / Holders / Phase" events
-   - **Recommendation: yes, support subscribe in v2 once base mechanism stable.**
-
-8. **Bonding curve activation logic:**
-   - Always-on hybrid? Or only when liquidity below threshold?
-   - Requires `beforeSwapReturnDelta` → custom-accounting → allowlist
-   - **Recommendation: drop from v1; v2 after allowlist secured.**
-
-9. **Per-launch configurability vs preset templates:**
-   - Full config = power but complex UX
-   - Templates ("memecoin", "RWA-token", "DAO-token", "fair-launch") = simple UX but limiting
-   - **Recommendation: templates with override params in our UI.**
-
-10. **Multisig governance vs NFT-only governance:**
-    - NFT-only: simpler, transferable, default
-    - Multisig manager: more professional for serious launches
-    - **Recommendation: NFT-only for v1 + `lpRecipient` flexibility (deployer can specify multisig as recipient); add `setManager` for v2.**
-
-11. **Custom accounting (`*ReturnDelta`) — include or exclude?** ✅ **DECIDED: include (strategy β)**
-    - Deploy `TokenLaunchHook` with **full permission set up-front** including `beforeSwapReturnDelta` + `afterSwapReturnDelta`
-    - One audit cycle, one Uniswap allowlist application
-    - Same hook contract serves both v1 (no ReturnDelta usage) and v2 (M6 bonding curve, M7 auto-buyback, M8 treasury routing) features
-    - Trade-off accepted: allowlist wait (4-12 weeks) before pool routes via Uniswap UI. Ship via [Fallback Distribution Strategy](#fallback-distribution-strategy) (Phase A — aggregators + own UI) until approval.
-
-## Risks
-
-| Risk | Severity | Mitigation |
-|------|----------|------------|
-| **Uniswap allowlist rejection or long delay** | 🔴 **CRITICAL** | Use fallback distribution (aggregators + own swap UI) until approved; build product NOT dependent on Uniswap UI |
-| Reputation: memecoin scams use our hook | 🔴 High | Position as "fair launch infra"; vet projects via opt-in audit |
-| Regulatory: ICO-like mechanisms = securities | 🔴 High | Geofence US users on frontend; legal review of templates |
-| MEV: sniper bots adapt to our anti-snipe | 🟡 Medium | Continuous iteration; collaborative testing with searchers |
-| Hook contract bug → ALL launches affected (blast radius) | 🔴 High | Single hook = one comprehensive audit (~$130K for full ReturnDelta scope); bug bounty pre-launch; hook is immutable post-deploy |
-| Wrapper bug breaks new launches | 🟡 Medium | Old launches still work (only `_beforeAddLiquidity` runs through hook). Deploy new wrapper version, UI updates |
-| Salt mining incorrectness for hook → bad flag bits | 🟡 Medium | Deploy script validates `Hooks.isValidHookAddress` post-deploy |
-| Init race in multi-step deploy (before atomic multicall) | 🟢 Low | `CampaignWrapper` uses atomic multicall — race window = 0 |
-| Governance NFT lost/burned mid-launch | 🟡 Medium | Hook blocks burn in Phase 1 via `_beforeRemoveLiquidity` |
-| AA wallets break `tx.origin` checks | 🟡 Medium | ECDSA signature pattern in v2; document v1 limitation |
-| Tax logic gas cost makes small swaps uneconomical | 🟡 Medium | Optimize gas; consider waiver for swaps below threshold |
-| `salt = tokenId` convention assumption wrong | 🟢 Low | **VERIFIED in PosM source** (lines 298/343/379/431 — all use `bytes32(tokenId)`); risk only if PosM updates this convention in future release |
-| `tx.origin == cfg.deployer` fails if deployer uses Safe | 🟡 Medium | Detect at wrapper level; offer ECDSA path or warn user |
-| Cross-pool storage contamination if PoolId computed wrong | 🟡 Medium | Use canonical `key.toId()`; test edge cases |
-| Competition from PinkSale/DxSale moves to V4 | 🟡 Medium | First-mover advantage; better tech moat |
-
-## Fallback Distribution Strategy
-
-Because Uniswap allowlist is uncertain (timing, possible rejection), the product **must not depend on Uniswap UI routing**. Plan:
-
-### Phase A: Pre-allowlist (Day 1)
-
-| Flow | Channel |
-|------|---------|
-| **Launch (create pool + first LP)** | Our custom Web3 UI → `CampaignWrapper` — no Uniswap UI needed |
-| **Swap** for retail users | Aggregators (1inch, 0x, ParaSwap) automatically pick up V4 pools regardless of allowlist; also our own minimal swap UI |
-| **Add/remove liquidity** (secondary LPs) | Our custom UI (PosM direct interaction); or wait for allowlist |
-| **Discovery** | Our launch directory + Twitter / Telegram sharing; URL deep-links |
-
-**Our UI does all the work.** Uniswap UI becomes optional.
-
-### Phase B: Post-allowlist (after Uniswap approves)
-
-| Flow | Channel |
-|------|---------|
-| Launch | Our UI (unchanged — UI superior for launch params) |
-| Swap | Uniswap UI (primary) + aggregators (continued) + our UI (fallback) |
-| Add/remove liquidity | Uniswap UI primary; our UI optional |
-| Discovery | Uniswap UI shows our pools; our directory remains |
-
-### Phase B alternative: Uniswap rejection
-
-If allowlist denied:
-- Continue with Phase A indefinitely
-- Aggregators are the primary routing layer for traders
-- We retain control of launch UX
-- Many memecoin launchpads (Pump.fun on Solana, etc.) operate this way successfully
-
-Either outcome — **product works**. Allowlist is a nice-to-have, not load-bearing.
-
-### What we control vs what depends on Uniswap
-
-| Component | Controlled by us | Depends on Uniswap |
-|-----------|-------------------|----------------------|
-| `CampaignWrapper` contract | ✅ | ❌ |
-| `TokenLaunchHook` contract logic | ✅ | ❌ (just contract code) |
-| Pool creation | ✅ (via PosM, public API) | ❌ |
-| Hook permissions allowlist | ❌ | ✅ |
-| Uniswap UI routing visibility | ❌ | ✅ |
-| Aggregator support | ❌ | Each aggregator independently |
-| Our launch UI | ✅ | ❌ |
-| Our swap fallback UI | ✅ | ❌ |
-
-## Market & Revenue Model
-
-**TAM:**
-- ~500K token launches/year on EVM
-- ~50K reach actual trading
-- ~5K cross $1M market cap
-- Existing infra revenue: $200M+/year (PinkSale, DxSale, Maestro, Banana Gun, others)
-
-**Capture strategy:**
-- 5% of EVM launches → ~25K launches/year using our hook
-- Average revenue per launch: $200-2000 (one-time launch fee + ongoing tax cut)
-- Realistic year 1: $5M revenue
-
-**Pricing model options:**
-- Flat launch fee: 0.1 ETH per pool deployment
-- % of seed liquidity: 0.5% taken from initial LP
-- % of ongoing tax: 10% of tax volume routed to our treasury
-- Combination of above
-
-## Verification Plan
-
-### Phase 1: Local Forge tests
-```bash
-forge test --match-path ./test/**/*.t.sol -vv
-```
-
-Tests are organized per module — each Finalized Spec section above lists its own test cases:
-
-| Test file | Module | Tests |
-|-----------|--------|-------|
-| `test/mechanisms/GovernanceModule.t.sol` | Governance | 15 |
-| `test/mechanisms/AntiSnipeMechanism.t.sol` | M1 | 8 |
-| `test/mechanisms/BuySellTaxMechanism.t.sol` | M2 | 14 |
-| `test/mechanisms/LiquidityLockMechanism.t.sol` | M3 | 20 |
-| `test/mechanisms/WhitelistPhaseMechanism.t.sol` | M5 | 19 |
-| `test/CampaignWrapper.t.sol` | Wrapper integration | atomic flow, edge cases |
-| `test/TokenLaunchHook.integration.t.sol` | End-to-end | multi-module interaction |
-| `test/TokenLaunchHook.race.t.sol` | Anti-sandwich | front-run resistance |
-| `test/TokenFactory.t.sol` | TokenFactory | clone deploy + init |
-
-**Total v1 mechanism unit tests: ~76** (excluding wrapper / integration / race tests).
-
-### Phase 2: Mainnet fork tests
-```bash
-forge test --fork-url $BASE_RPC --match-path ./test/TokenLaunchHook.fork.t.sol
-```
-Test against live Uniswap V4 PoolManager on Base.
-
-### Phase 3: Testnet deployment
-- Deploy on Base Sepolia with mock token
-- Launch full scenario: anti-snipe → tax → unlock
-- Verify with sample sniper bot, retail trader, sell-pressure simulator
-
-### Phase 4: Audit + mainnet
-- External audit (Spearbit, Trail of Bits, or specialized launchpad auditor)
-- Bug bounty on Immunefi pre-mainnet (~$50K)
-- Mainnet deploy on Base or Unichain (cheaper gas for launches)
-
-## Out of Scope (v1)
-
-- Cross-chain launches (single chain per launch in v1)
-- Dynamic re-configuration (config locked post-launch except via governance NFT)
-- IDO-style price discovery auctions (consider for v2)
-- Vesting cliff schedules for project team (deploy separate vesting contract; pass as `lpRecipient`)
-- Token mechanics beyond standard ERC-20 (taxable transfer, blacklist, etc.) — use existingToken path
-- Cross-pool atomic operations (e.g., multi-token launches)
-
-## Roadmap
-
-| Phase | Duration | Deliverable |
-|-------|----------|-------------|
-| **Pre-coding research** | 1 week | ~~Verify salt convention~~ ✅; salt mining feasibility; Uniswap allowlist process |
-| **Architectural spec lock** | 1 week | Modular structure agreed; main hook skeleton + module template proven |
-| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5). Each: design doc + interface + open questions resolved |
-| **Mandatory modules** (M1-M3) + Governance + Wrapper | 5 weeks | Anti-snipe, tax, lock, governance NFT, atomic launch flow; 90% test coverage |
-| **Optional modules** (M5) | 1-2 weeks | M5 ~3-4 days incl. tests |
-| **Token deployment** (TokenFactory + StandardToken) | 1 week | Cheap ERC-20 clones; integration with Wrapper |
-| **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form with presets; wallet connect; deep links |
-| **Submit Uniswap allowlist application** | parallel | Submit ASAP after testnet artifact exists — covers full permission set (incl. `*ReturnDelta`); review typically 4-12 weeks |
-| **Audit** | 4-6 weeks | External audit of hook + wrapper + factory + each module (~$130K — full permission scope incl. ReturnDelta surfaces); fixes; bug bounty |
-| **Testnet launch + beta** | 4 weeks | Base Sepolia + Unichain Sepolia; 3-5 beta launches with friendly projects; use Phase A fallback distribution |
-| **Mainnet ship (via Phase A)** | — | Deploy on Base/Unichain first (cheap), Arbitrum (good liquidity), Mainnet last. **Launches operational via aggregators + our UI** even before Uniswap allowlist resolves |
-| **Allowlist approval** | TBD (parallel) | Once approved, pools auto-route via Uniswap UI (Phase B) — no contract changes |
-| **(v2)** Custom-accounting modules | TBD | M8 (Treasury), M6 (Bonding curve), M7 (Auto-buyback) — code-only additions to existing hook (permissions already enabled) |
-
-**Total to v1 mainnet: ~5-6 months.** Allowlist approval is parallel — product ships via Phase A regardless. Phase B begins automatically when Uniswap approves.
-
-## Open Questions for Future Sessions
-
-### ✅ Resolved
-
-- ~~`salt = bytes32(tokenId)` in V4 PositionManager~~ — verified at `PositionManager.sol` lines 298, 343, 379, 431. All liquidity actions use this convention. `nextTokenId` is publicly readable for off-chain prediction.
-
-- ~~**Hook permission scope**~~ → **Decision: β (Full permission set upfront)**. Deploy `TokenLaunchHook` with all permissions including `beforeSwapReturnDelta` + `afterSwapReturnDelta` from day 1. Trade-off accepted: wait for Uniswap allowlist before pool routing via Uniswap UI; ship via Fallback Distribution (Phase A) until approved. **Reasoning:** single contract serves v1 + v2 features → one audit cycle, one allowlist application, no migration story for existing launches when v2 modules ship. Higher upfront cost (allowlist wait + bigger audit scope) buys long-term operational simplicity.
-
-### 🔴 Critical architectural decisions
-
-1. **Per-module deep-dive specs** — each module in [Module catalog](#module-catalog-v1--planned-v2) requires its own session covering:
-   - Storage struct layout (immutable vs mutable fields, slot packing)
-   - Callback invocation order (which module runs first when multiple are enabled)
-   - Governance setter scope (which params mutable, monotone bounds, who can call)
-   - Events for indexer consumption
-   - Per-module test fixtures (mock hook for isolated unit tests)
-
-2. **Cross-module interaction rules** — concrete cases to nail down before coding:
-   - **Whitelist (M5) + Anti-snipe (M1)**: order in `_beforeSwap`? Likely whitelist first (cheaper revert path).
-
-### 🔵 v2 architectural decisions (post-v1)
-
-3. **AA wallet support** — ECDSA signature pattern (EIP-712) to replace `tx.origin` check for first-LP authentication. Required for Safe / Argent / Biconomy deployers. Decide signing flow: does wrapper recover signature, does hook recover signature, or off-chain ceremony with on-chain nonce?
-
-4. **Sandwich resistance for dynamic tax** (post-allowlist) — fee changing within block can be exploited. Pick approach: commit-reveal scheme? per-block fee freeze? rate limiting? Trade-off between latency and protection.
-
-5. **v2 module rollout strategy** — adding M6/M7/M8 to existing hook is impossible (immutable). Options when v2 modules are ready:
-   - Deploy entirely new hook with same permissions + new modules → existing pools stay on old hook
-   - Or: design v1 hook with all v2 modules already inherited but disabled via enable flags (only flip on for new launches once Uniswap re-approves) — requires forecasting v2 modules during v1 development
-
-### 📋 Operational / process (not architectural — track separately)
-
-These are **not architectural blockers** but need to be done at the right time in the project lifecycle:
-
-| # | Item | When |
-|---|------|------|
-| O1 | Allowlist process research — get application form URL from Uniswap support response; identify required materials (code repo, audit report, testnet deployment, technical writeup) | Before submitting application |
-| O2 | Submit allowlist application | Once testable artifact exists (mid-development) |
-| O3 | Reference PR review — study WETHHook, aggregator hooks PR history in `v4-hooks-public` for clues on review criteria | Anytime before submission |
-| O4 | `PositionManager.multicall` behavioral verification — `initializePool + modifyLiquidities` in one call, `msg.value` forwarded, `hookData` propagation | Before wrapper coding |
-| O5 | Salt mining benchmark — `vm.computeCreate2Address` time on commodity hardware for permission flag bits | Before deploy script |
-| O6 | External audit selection (Spearbit, Trail of Bits, OpenZeppelin, specialized launchpad auditor) | Pre-mainnet |
-| O7 | Testnet deployments (Base Sepolia, Unichain Sepolia) + integration testing | After core code + tests |
-
-### Not tracked here (out of scope or already decided)
-
-- Branding / product positioning → product/marketing concern
-- UI tech stack → frontend project, separate doc
-- Launchpad partnerships → business development
-- Token deployment options → decided: strictly minimal ERC-20 via TokenFactory; custom tokens via `existingToken`
-- Wrapper failure modes → decided: deploy token only after multicall succeeds (or use try/catch in wrapper)
-- `tx.origin` vs ECDSA — decided: `tx.origin` for v1, ECDSA in v2 (see Open Design Decisions)
-- EnabledMechanisms storage layout, inheritance ordering — implementation-time details
+- **OpenZeppelin `Clones`** (`@openzeppelin/contracts/proxy/Clones.sol`) — for `TokenFactory` ERC-20 minimal proxies. NOT used for the hook itself.
+- **`Multicall_v4`** in PositionManager — atomic batching of `initializePool + modifyLiquidities`; forwards `msg.value`.
+- **`Permit2`** approval flow — pre-signed token approval used inside `CampaignWrapper`.
+- **Dynamic fee** via `LPFeeLibrary.DYNAMIC_FEE_FLAG` + per-swap fee in `_beforeSwap` return value (M2).
+- **`BalanceDelta`** for swap amount tracking (M3 volume).
+- **`StateLibrary`** for reading pool state (slot0, position) inside callbacks.
+- **`Hooks.isValidHookAddress`** for verifying mined hook deploy address has correct flag bits.
