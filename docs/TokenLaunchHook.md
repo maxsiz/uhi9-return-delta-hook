@@ -1666,6 +1666,219 @@ test_nonGovNFT_removeLiquidity_unrestricted          (L8)
 - **Edge case: relax to current `block.timestamp`**: `newTime < cfg.unlockTime` allows setting to `block.timestamp - 1`, effectively "unlock now if other conditions met". Useful for emergency unlock.
 - **No "reachability check" on volumeThreshold (L10)**: deployer could set `unlockVolumeThreshold = type(uint128).max` → effectively never unlocks via volume. That's their choice; gov can lower if mistake.
 
+## M5 WhitelistPhaseMechanism — Finalized Spec
+
+### Purpose
+
+Phased access control: only **whitelisted addresses** can interact with the pool (buys, sells, LP adds) until a configurable end time. After endTime expires, restrictions lift entirely. Removal of liquidity (`decreaseLiquidity` / `burn`) is **always** allowed even for non-whitelisted addresses — anyone with a position can exit (W11).
+
+**Use cases:**
+- **RWA / Permissioned**: KYC required for trading. `whitelistEndTime = launchEndTime` for full launch protection.
+- **Fair launch**: early-access for community members. Whitelist for first hours/days, then open.
+- **ICO-like presale**: only pre-sale participants buy early.
+
+### Design decisions (W1-W12 locked)
+
+| # | Decision |
+|---|----------|
+| W1 | **DIRECT mode only** — in-hook mapping, no external oracle. EXTERNAL_ORACLE and MERKLE deferred to v2. |
+| W2 | Single boundary (`whitelistEndTime`). Multi-phase deferred to v2. |
+| W3 | **No granular flags.** Whitelist gates ALL actions (buys, sells, LP adds) — simpler, no edge cases. |
+| W4 | Gov can both ADD and REMOVE addresses. Both emit events. Batch versions provided. |
+| W5 | N/A (no oracle anymore — W1) |
+| W6 | N/A (no oracle anymore — W1) |
+| W7 + W8 | `whitelistEndTime ∈ (launchTime, launchEndTime]`. Whitelist phase bounded by launch lifecycle. |
+| W9 | `tx.origin` for whitelist check (AA limitation noted; v2 fix via signature). |
+| W10 | Batch `addManyToWhitelist` / `removeManyFromWhitelist` for bulk operations. |
+| W11 | Removing liquidity always allowed (even for non-whitelisted). Allows position exit. |
+| W12 | N/A (no per-action flags — W3) |
+
+### Configuration (1 slot per pool, 8 bytes used)
+
+```solidity
+struct WhitelistPhaseConfig {
+    uint64 whitelistEndTime;     // must be > launchTime AND <= launchEndTime
+    // 8 bytes used; rest of slot unused (room for v2 extensions)
+}
+
+struct WhitelistPhaseState {
+    mapping(address => bool) whitelisted;
+}
+
+mapping(PoolId => WhitelistPhaseConfig) internal _whitelistConfigs;
+mapping(PoolId => WhitelistPhaseState) internal _whitelistStates;
+```
+
+**Storage cost:**
+- 1 slot per pool for config
+- 1 slot per (pool, address) for state — grows with whitelist size
+
+### Check logic
+
+```solidity
+function _checkWhitelist(PoolId pid) internal view {
+    WhitelistPhaseConfig storage cfg = _whitelistConfigs[pid];
+    if (block.timestamp >= cfg.whitelistEndTime) return;  // window expired — open phase
+    if (!_whitelistStates[pid].whitelisted[tx.origin]) revert NotWhitelisted();
+}
+```
+
+Single check covers all gated actions (W3). Applied to:
+- `_beforeSwap`: catches both buys and sells
+- `_beforeAddLiquidity`: catches LP adds (except bootstrap — see Integration)
+
+NOT applied to `_beforeRemoveLiquidity` (W11 — always allow exit).
+
+### Skeleton
+
+```solidity
+abstract contract WhitelistPhaseMechanism {
+    mapping(PoolId => WhitelistPhaseConfig) internal _whitelistConfigs;
+    mapping(PoolId => WhitelistPhaseState) internal _whitelistStates;
+    
+    error NotWhitelisted();
+    error InvalidWhitelistEndTime();
+    error CanOnlyRelax();
+    
+    event WhitelistPhaseInitialized(PoolId indexed pid, uint64 whitelistEndTime);
+    event WhitelistEndTimeRelaxed(PoolId indexed pid, uint64 oldTime, uint64 newTime);
+    event AddressWhitelisted(PoolId indexed pid, address indexed user);
+    event AddressUnwhitelisted(PoolId indexed pid, address indexed user);
+    
+    function _initWhitelist(
+        PoolId pid, 
+        WhitelistPhaseConfig memory cfg, 
+        uint64 launchTime, 
+        uint64 launchEndTime
+    ) internal {
+        // W7 + W8: bounded by launch lifecycle
+        if (cfg.whitelistEndTime <= launchTime) revert InvalidWhitelistEndTime();
+        if (cfg.whitelistEndTime > launchEndTime) revert InvalidWhitelistEndTime();
+        _whitelistConfigs[pid] = cfg;
+        emit WhitelistPhaseInitialized(pid, cfg.whitelistEndTime);
+    }
+    
+    function _checkWhitelist(PoolId pid) internal view {
+        WhitelistPhaseConfig storage cfg = _whitelistConfigs[pid];
+        if (block.timestamp >= cfg.whitelistEndTime) return;
+        if (!_whitelistStates[pid].whitelisted[tx.origin]) revert NotWhitelisted();
+    }
+    
+    // ─── Governance setters ───
+    
+    function addToWhitelist(PoolId pid, address user) external onlyGovernance(pid) {
+        _whitelistStates[pid].whitelisted[user] = true;
+        emit AddressWhitelisted(pid, user);
+    }
+    
+    function addManyToWhitelist(PoolId pid, address[] calldata users) external onlyGovernance(pid) {
+        WhitelistPhaseState storage state = _whitelistStates[pid];
+        for (uint256 i = 0; i < users.length; i++) {
+            state.whitelisted[users[i]] = true;
+            emit AddressWhitelisted(pid, users[i]);
+        }
+    }
+    
+    function removeFromWhitelist(PoolId pid, address user) external onlyGovernance(pid) {
+        _whitelistStates[pid].whitelisted[user] = false;
+        emit AddressUnwhitelisted(pid, user);
+    }
+    
+    function removeManyFromWhitelist(PoolId pid, address[] calldata users) external onlyGovernance(pid) {
+        WhitelistPhaseState storage state = _whitelistStates[pid];
+        for (uint256 i = 0; i < users.length; i++) {
+            state.whitelisted[users[i]] = false;
+            emit AddressUnwhitelisted(pid, users[i]);
+        }
+    }
+    
+    function relaxWhitelistEndTime(PoolId pid, uint64 newEndTime) external onlyGovernance(pid) {
+        WhitelistPhaseConfig storage cfg = _whitelistConfigs[pid];
+        if (newEndTime >= cfg.whitelistEndTime) revert CanOnlyRelax();
+        uint64 old = cfg.whitelistEndTime;
+        cfg.whitelistEndTime = newEndTime;
+        emit WhitelistEndTimeRelaxed(pid, old, newEndTime);
+    }
+    
+    // Views
+    function whitelistConfigOf(PoolId pid) external view returns (WhitelistPhaseConfig memory) {
+        return _whitelistConfigs[pid];
+    }
+    
+    function isAddressWhitelisted(PoolId pid, address user) external view returns (bool) {
+        return _whitelistStates[pid].whitelisted[user];
+    }
+}
+```
+
+### Integration in main hook
+
+```solidity
+function _beforeSwap(...) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+    PoolId pid = key.toId();
+    EnabledMechanisms memory en = enabled[pid];
+    GovernanceState storage gov = _governance[pid];
+    
+    if (en.whitelist) _checkWhitelist(pid);           // gates BOTH directions (W3)
+    if (en.antiSnipe) _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
+    // ...
+    
+    uint24 fee = en.tax ? _currentTax(pid, params, gov.tokenIsCurrency0, gov.launchTime) : 0;
+    return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), fee);
+}
+
+function _beforeAddLiquidity(...) internal override returns (bytes4) {
+    PoolId pid = key.toId();
+    GovernanceState storage state = _governance[pid];
+    
+    if (!state.initialized) {
+        // Bootstrap path — skip whitelist check (deployer doesn't need to be whitelisted)
+        _initGovernance(pid, params, decoded.govCfg, sender);
+        // ... init other enabled modules from hookData
+        return this.beforeAddLiquidity.selector;
+    }
+    
+    EnabledMechanisms memory en = enabled[pid];
+    if (en.whitelist) _checkWhitelist(pid);           // gates LP adds (W3)
+    
+    return this.beforeAddLiquidity.selector;
+}
+
+// _beforeRemoveLiquidity — NO whitelist check (W11: always allow exit)
+```
+
+### Test cases (19 tests in `test/mechanisms/WhitelistPhaseMechanism.t.sol`)
+
+```
+test_init_storesConfig_emitsEvent
+test_init_endTimeAtOrBeforeLaunchTime_reverts            (InvalidWhitelistEndTime)
+test_init_endTimeAfterLaunchEnd_reverts                  (InvalidWhitelistEndTime)
+test_whitelisted_canBuy
+test_whitelisted_canSell
+test_whitelisted_canAddLiquidity
+test_nonWhitelisted_cannotBuy                            (NotWhitelisted)
+test_nonWhitelisted_cannotSell                           (NotWhitelisted)
+test_nonWhitelisted_cannotAddLiquidity                   (NotWhitelisted)
+test_nonWhitelisted_canAlwaysRemoveLiquidity             (W11)
+test_afterEndTime_unrestricted_evenNonWhitelisted
+test_bootstrap_skipsWhitelistCheck                       (deployer doesn't need to be whitelisted)
+test_addToWhitelist_byOwner_succeeds_emitsEvent
+test_addManyToWhitelist_batch_emitsEvents
+test_removeFromWhitelist_byOwner_succeeds_emitsEvent
+test_removeManyFromWhitelist_batch_emitsEvents
+test_addToWhitelist_byNonOwner_reverts                   (NotGovernanceOwner)
+test_relaxEndTime_byOwner_succeeds
+test_relaxEndTime_laterThanCurrent_reverts               (CanOnlyRelax)
+```
+
+### Edge cases / notes
+
+- **Bootstrap path bypass**: at first mint, `state.initialized == false` → governance init runs and module init configures whitelist. Deployer's first mint doesn't require their address to be whitelisted (they configure the list during the same atomic TX).
+- **Whitelist bounded by launch lifecycle (W7+W8)**: `whitelistEndTime` is in `(launchTime, launchEndTime]`. After `launchEndTime`, governance phase is frozen anyway — whitelist must conclude by then. For "RWA permanent gating", deployer sets `launchDuration = 365 days` (MAX from G7) and `whitelistEndTime = launchTime + 365 days`. v2 may revisit unbounded whitelists.
+- **Storage growth**: each whitelisted address consumes 1 slot. For a launch with 10,000 KYC'd users, that's 10K SSTOREs at bootstrap or via batch — costly. Recommendation: use `addManyToWhitelist` in chunks of 100-200 per TX to manage gas.
+- **W11 rationale**: removing liquidity is asset withdrawal. Blocking it could trap user funds. Even if a user gets removed from whitelist (after adding liquidity earlier), they can still exit. M3 LiquidityLock separately protects the governance NFT — that's deployer's own LP, not third-party LPs.
+- **Bootstrap multicall order**: in `CampaignWrapper.launchCampaign`, after governance bootstrap completes, the wrapper can immediately call `addManyToWhitelist` for the initial KYC list — all in same atomic launch TX.
+
 ## Parameter Mutability & Lifecycle Phases
 
 ### Mutability matrix
