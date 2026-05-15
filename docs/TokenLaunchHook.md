@@ -565,7 +565,6 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 | **M2** | `BuySellTaxMechanism` (dynamic LP fee) | `_beforeSwap` (fee override) | **v1** | Mandatory |
 | **M3** | `LiquidityLockMechanism` (incl. vesting) | `_beforeRemoveLiquidity` (revert) | **v1** | Mandatory (was M3+M4 merged) |
 | **M5** | `WhitelistPhaseMechanism` | `_beforeSwap` + `_beforeAddLiquidity` (revert) | **v1** | Optional per-launch |
-| **M12** | `InsiderRulesMechanism` (different tax/lock for whitelisted addresses) | `_beforeSwap` | **v1** | Optional |
 | **M8** | `TreasuryFeeRoutingMechanism` | `_afterSwap` + `afterSwapReturnDelta` | **v2** | Requires custom accounting; post-allowlist |
 | **M6** | `BondingCurveFallbackMechanism` | `_beforeSwap` + `beforeSwapReturnDelta` | **v2** | Complex math; post-allowlist |
 | **M7** | `AutoBuybackMechanism` | `_afterSwap` + atomic swap | **v2** | Defer to v2 |
@@ -579,6 +578,7 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 - ~~M14~~ → removed entirely (cumulative buy cap not pursued)
 - ~~M10~~ → removed entirely (anti-flip not pursued; transfer loophole and DCA penalty made v1 trade-offs unattractive)
 - ~~M13~~ → removed entirely (block-0 buyer blacklist not pursued; transfer loophole limited effectiveness, M1 + M2 deemed sufficient for sniper deterrence)
+- ~~M12~~ → removed entirely (insider rules not pursued; complexity from cross-module overrides, deployer can workaround via M5 whitelist + M2 tax tuning)
 
 ### Per-launch enable flags + presets
 
@@ -588,7 +588,7 @@ Custom UI can offer **presets** that pre-select sensible flag combinations:
 |--------|--------------------|
 | **Memecoin** | M1 + M2 + M3 |
 | **Fair Launch** | M1 + M2 + M3 |
-| **RWA / Permissioned** | M3 + M5 + M12 |
+| **RWA / Permissioned** | M3 + M5 |
 | **DAO Token** | M2 + M3 |
 | **Custom** | Full toggle UI for all modules |
 
@@ -614,7 +614,6 @@ Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAd
 | `src/mechanisms/BuySellTaxMechanism.sol` | M2 — asymmetric tax via dynamic LP fee | v1 mandatory |
 | `src/mechanisms/LiquidityLockMechanism.sol` | M3 — conditional + vesting unlock | v1 mandatory |
 | `src/mechanisms/WhitelistPhaseMechanism.sol` | M5 — phased KYC/allowlist access | v1 optional |
-| `src/mechanisms/InsiderRulesMechanism.sol` | M12 — separate rules for whitelisted insiders | v1 optional |
 | `src/mechanisms/TreasuryFeeRoutingMechanism.sol` | M8 — fees to treasury via afterSwapReturnDelta | v2 (post-allowlist) |
 | `src/mechanisms/BondingCurveMechanism.sol` | M6 — fallback for thin-liquidity launches | v2 |
 | `src/mechanisms/AutoBuybackMechanism.sol` | M7 — atomic counter-buy on sell pressure | v2 |
@@ -1158,7 +1157,7 @@ function _beforeSwap(
     if (en.antiSnipe) {
         _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
     }
-    // ... dispatch to other modules (M5, M12, etc.)
+    // ... dispatch to other modules (M5, etc.)
     
     uint24 fee = en.tax ? _calculateTax(pid, params, gov) : 0;
     return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), fee);
@@ -1366,7 +1365,7 @@ function _beforeSwap(...) internal override returns (bytes4, BeforeSwapDelta, ui
     if (en.antiSnipe) {
         _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
     }
-    // ... other modules (M5, M12, etc.)
+    // ... other modules (M5, etc.)
     
     uint24 fee = 0;
     if (en.tax) {
@@ -2206,9 +2205,9 @@ Test against live Uniswap V4 PoolManager on Base.
 |-------|----------|-------------|
 | **Pre-coding research** | 1 week | ~~Verify salt convention~~ ✅; salt mining feasibility; Uniswap allowlist process |
 | **Architectural spec lock** | 1 week | Modular structure agreed; main hook skeleton + module template proven |
-| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5, M12). Each: design doc + interface + open questions resolved |
+| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5). Each: design doc + interface + open questions resolved |
 | **Mandatory modules** (M1-M3) + Governance + Wrapper | 5 weeks | Anti-snipe, tax, lock, governance NFT, atomic launch flow; 90% test coverage |
-| **Optional modules** (M5, M12) | 3 weeks | Each module ~3-4 days incl. tests |
+| **Optional modules** (M5) | 1-2 weeks | M5 ~3-4 days incl. tests |
 | **Token deployment** (TokenFactory + StandardToken) | 1 week | Cheap ERC-20 clones; integration with Wrapper |
 | **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form with presets; wallet connect; deep links |
 | **Submit Uniswap allowlist application** | parallel | Submit ASAP after testnet artifact exists — covers full permission set (incl. `*ReturnDelta`); review typically 4-12 weeks |
@@ -2239,8 +2238,6 @@ Test against live Uniswap V4 PoolManager on Base.
 
 2. **Cross-module interaction rules** — concrete cases to nail down before coding:
    - **Whitelist (M5) + Anti-snipe (M1)**: order in `_beforeSwap`? Likely whitelist first (cheaper revert path).
-   - **Insider rules (M12) + Tax (M2)**: does insider rule override the tax decay schedule for whitelisted addresses?
-   - **Insider (M12) + Anti-snipe (M1)**: are insiders exempt from anti-snipe limits in block 0?
 
 ### 🔵 v2 architectural decisions (post-v1)
 
