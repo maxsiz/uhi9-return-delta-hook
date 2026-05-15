@@ -573,7 +573,6 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 | **M10** | `MinHoldTimeMechanism` (anti-flip) | `_beforeSwap` (track + revert) | **v1** | Optional |
 | **M12** | `InsiderRulesMechanism` (different tax/lock for whitelisted addresses) | `_beforeSwap` | **v1** | Optional |
 | **M13** | `SniperBlacklistMechanism` (block-0 buyer snapshot) | `_afterSwap` (track) + `_beforeSwap` (check) | **v1** | Optional, complements M1 |
-| **M14** | `TradeVolumeCapMechanism` (max % per address) | `_beforeSwap` (track + limit) | **v1** | Optional |
 | **M8** | `TreasuryFeeRoutingMechanism` | `_afterSwap` + `afterSwapReturnDelta` | **v2** | Requires custom accounting; post-allowlist |
 | **M6** | `BondingCurveFallbackMechanism` | `_beforeSwap` + `beforeSwapReturnDelta` | **v2** | Complex math; post-allowlist |
 | **M7** | `AutoBuybackMechanism` | `_afterSwap` + atomic swap | **v2** | Defer to v2 |
@@ -584,6 +583,7 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 - M4 (Vesting) → merged into M3 (LiquidityLock supports vesting schedule as one of its unlock modes)
 - ~~M6, M7, M8~~ → deferred to v2 (custom-accounting permissions, more design needed)
 - ~~M9, M11~~ → deferred to v2 (M9 gas concerns, M11 cross-module design with M8)
+- ~~M14~~ → removed entirely (cumulative buy cap not pursued)
 
 ### Per-launch enable flags + presets
 
@@ -591,8 +591,8 @@ Custom UI can offer **presets** that pre-select sensible flag combinations:
 
 | Preset | Enabled mechanisms |
 |--------|--------------------|
-| **Memecoin** | M1 + M2 + M3 + M13 + M14 |
-| **Fair Launch** | M1 + M2 + M3 + M14 |
+| **Memecoin** | M1 + M2 + M3 + M13 |
+| **Fair Launch** | M1 + M2 + M3 |
 | **RWA / Permissioned** | M3 + M5 + M12 |
 | **DAO Token** | M2 + M3 |
 | **Custom** | Full toggle UI for all modules |
@@ -622,7 +622,6 @@ Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAd
 | `src/mechanisms/MinHoldTimeMechanism.sol` | M10 — anti-flip cool-down | v1 optional |
 | `src/mechanisms/InsiderRulesMechanism.sol` | M12 — separate rules for whitelisted insiders | v1 optional |
 | `src/mechanisms/SniperBlacklistMechanism.sol` | M13 — block-0 buyer blacklist | v1 optional |
-| `src/mechanisms/TradeVolumeCapMechanism.sol` | M14 — max % supply per address | v1 optional |
 | `src/mechanisms/TreasuryFeeRoutingMechanism.sol` | M8 — fees to treasury via afterSwapReturnDelta | v2 (post-allowlist) |
 | `src/mechanisms/BondingCurveMechanism.sol` | M6 — fallback for thin-liquidity launches | v2 |
 | `src/mechanisms/AutoBuybackMechanism.sol` | M7 — atomic counter-buy on sell pressure | v2 |
@@ -1166,7 +1165,7 @@ function _beforeSwap(
     if (en.antiSnipe) {
         _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
     }
-    // ... dispatch to other modules (M5, M12, M14, etc.)
+    // ... dispatch to other modules (M5, M12, etc.)
     
     uint24 fee = en.tax ? _calculateTax(pid, params, gov) : 0;
     return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), fee);
@@ -1374,7 +1373,7 @@ function _beforeSwap(...) internal override returns (bytes4, BeforeSwapDelta, ui
     if (en.antiSnipe) {
         _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
     }
-    // ... other modules (M5, M12, M14, etc.)
+    // ... other modules (M5, M12, etc.)
     
     uint24 fee = 0;
     if (en.tax) {
@@ -2001,9 +2000,9 @@ Test against live Uniswap V4 PoolManager on Base.
 |-------|----------|-------------|
 | **Pre-coding research** | 1 week | ~~Verify salt convention~~ ✅; salt mining feasibility; Uniswap allowlist process |
 | **Architectural spec lock** | 1 week | Modular structure agreed; main hook skeleton + module template proven |
-| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5, M10, M12, M13, M14). Each: design doc + interface + open questions resolved |
+| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5, M10, M12, M13). Each: design doc + interface + open questions resolved |
 | **Mandatory modules** (M1-M3) + Governance + Wrapper | 5 weeks | Anti-snipe, tax, lock, governance NFT, atomic launch flow; 90% test coverage |
-| **Optional modules** (M5, M10, M12, M13, M14) | 3 weeks | Each module ~3-4 days incl. tests |
+| **Optional modules** (M5, M10, M12, M13) | 3 weeks | Each module ~3-4 days incl. tests |
 | **Token deployment** (TokenFactory + StandardToken) | 1 week | Cheap ERC-20 clones; integration with Wrapper |
 | **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form with presets; wallet connect; deep links |
 | **Submit Uniswap allowlist application** | parallel | Submit ASAP after testnet artifact exists — covers full permission set (incl. `*ReturnDelta`); review typically 4-12 weeks |
@@ -2036,7 +2035,6 @@ Test against live Uniswap V4 PoolManager on Base.
    - **Whitelist (M5) + Anti-snipe (M1)**: order in `_beforeSwap`? Likely whitelist first (cheaper revert path).
    - **Insider rules (M12) + Tax (M2)**: does insider rule override the tax decay schedule for whitelisted addresses?
    - **Insider (M12) + Anti-snipe (M1)**: are insiders exempt from anti-snipe limits in block 0?
-   - **Trade Volume Cap (M14) + Insider (M12)**: insider addresses exempt from per-address cap?
    - **Sniper blacklist (M13) + Lock (M3)**: blacklisted seller can't sell but tries to remove liquidity — block via `_beforeRemoveLiquidity` too, or allow withdrawal of principal only?
    - **Min Hold Time (M10) + Sniper blacklist (M13)**: do these compose or are they alternative anti-flip strategies?
 
