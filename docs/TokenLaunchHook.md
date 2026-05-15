@@ -1202,6 +1202,218 @@ test_buy_afterWindowExpires_unrestricted
 - **No state writes** → zero gas overhead from SSTOREs. Only SLOADs for config check.
 - **MAX duration choice (1 day)**: longer than typical memecoin attention span but allows extended fair-launch periods. Easily adjustable via constant if needed in v2.
 
+## M2 BuySellTaxMechanism — Finalized Spec
+
+### Purpose
+
+Asymmetric tax via **V4 dynamic LP fee** mechanism. Higher fees on sells (deter dumping), lower on buys (encourage accumulation). Linear decay over time toward a base rate. v1 uses dynamic LP fee only (no `*ReturnDelta`) — fees flow naturally to LP holders. Treasury routing deferred to v2 (M8).
+
+### Design decisions (T1-T12 locked)
+
+| # | Decision |
+|---|----------|
+| T1 | Linear decay curve (initial → base over decayDuration) |
+| T2 | `MAX_TAX = 100_000` V4 units = 10% (sane upper bound) |
+| T3 | Override = ceiling: `effective = min(decayed, manualOverride)` |
+| T4 | `0` = no-override convention for `manualBuyTax`/`manualSellTax` |
+| T5 | `decayDuration` immutable in v1 (only overrides mutable) |
+| T6 | 100% of fees to LPs in v1; v2 adds M8 TreasuryRouting |
+| T7 | Single shared `decayDuration` for both buy/sell directions |
+| T8 | `TaxApplied` event per swap (indexed fields only — cheap, indexer-friendly) |
+| T9 | Override capped at `MAX_TAX`; must strictly lower current override (one-way ratchet) |
+| T10 | At `elapsed = 0`: returns `initialTax` (linear formula yields initial - 0) |
+| T11 | `decayDuration = 0` → instant decay; effective = baseTax always (static-tax launches) |
+| T12 | Manual overrides packed in same config struct (1 slot total) |
+
+### Units
+
+V4 dynamic fee uses **hundredths of basis points**:
+- `1e4` = 1%
+- `1e6` = 100% (V4 ceiling)
+- Our `MAX_TAX = 1e5` = 10%
+
+Using `uint24` directly matches V4 fee type — no conversion needed at hook callback boundary.
+
+### Configuration (1 slot per pool, 19 bytes used)
+
+```solidity
+struct BuySellTaxConfig {
+    // ─── Immutable post-bootstrap (T5) ───
+    uint24 initialBuyTax;       // V4 fee units, capped at MAX_TAX
+    uint24 initialSellTax;
+    uint24 baseTax;             // final tax after decay (or always if decayDuration=0)
+    uint32 decayDuration;       // seconds (0 = instant decay to baseTax)
+    
+    // ─── Mutable by governance, one-way ratchet down (T3, T9) ───
+    uint24 manualBuyTax;        // 0 = no override (T4)
+    uint24 manualSellTax;
+    
+    // Total: 24×5 + 32 = 152 bits = 19 bytes → fits in 1 slot ✓
+}
+
+mapping(PoolId => BuySellTaxConfig) internal _taxConfigs;
+```
+
+### Constants
+
+```solidity
+uint24 internal constant MAX_TAX = 100_000;  // 10% in V4 fee units
+```
+
+### Decay curve (linear, T1)
+
+```
+if decayDuration == 0 OR elapsed >= decayDuration:
+    tax = baseTax
+else:
+    tax = initialTax - (initialTax - baseTax) × elapsed / decayDuration
+```
+
+**Example:** 5% initial sell, 0.3% base, 30-day decay:
+- Day 0: 5.00%
+- Day 7: ≈ 3.90%
+- Day 15: ≈ 2.65%
+- Day 30+: 0.30%
+
+### Skeleton
+
+```solidity
+abstract contract BuySellTaxMechanism {
+    uint24 internal constant MAX_TAX = 100_000;
+    
+    mapping(PoolId => BuySellTaxConfig) internal _taxConfigs;
+    
+    error InvalidTaxConfig();
+    error TaxExceedsMax();
+    error CanOnlyLowerTax();
+    
+    event BuySellTaxInitialized(PoolId indexed pid, BuySellTaxConfig cfg);
+    event TaxOverrideSet(PoolId indexed pid, bool isBuy, uint24 oldValue, uint24 newValue);
+    event TaxApplied(PoolId indexed pid, address indexed trader, bool isBuy, uint24 feeBps);
+    
+    function _initTax(PoolId pid, BuySellTaxConfig memory cfg) internal {
+        if (cfg.initialBuyTax > MAX_TAX) revert TaxExceedsMax();
+        if (cfg.initialSellTax > MAX_TAX) revert TaxExceedsMax();
+        if (cfg.baseTax > MAX_TAX) revert TaxExceedsMax();
+        if (cfg.baseTax > cfg.initialBuyTax || cfg.baseTax > cfg.initialSellTax) {
+            revert InvalidTaxConfig();
+        }
+        if (cfg.manualBuyTax != 0 || cfg.manualSellTax != 0) revert InvalidTaxConfig();
+        _taxConfigs[pid] = cfg;
+        emit BuySellTaxInitialized(pid, cfg);
+    }
+    
+    /// @notice Compute the effective tax for a swap. Stateless (no SSTOREs).
+    function _currentTax(
+        PoolId pid,
+        SwapParams calldata params,
+        bool tokenIsCurrency0,
+        uint64 launchTime
+    ) internal view returns (uint24) {
+        bool isBuy = (params.zeroForOne != tokenIsCurrency0);
+        BuySellTaxConfig storage cfg = _taxConfigs[pid];
+        uint24 initial = isBuy ? cfg.initialBuyTax : cfg.initialSellTax;
+        uint24 manual = isBuy ? cfg.manualBuyTax : cfg.manualSellTax;
+        
+        uint24 decayed = _decayedTax(
+            initial, cfg.baseTax, cfg.decayDuration, block.timestamp - launchTime
+        );
+        if (manual == 0) return decayed;
+        return decayed < manual ? decayed : manual;
+    }
+    
+    function _decayedTax(uint24 initial, uint24 base, uint32 duration, uint256 elapsed) 
+        internal pure returns (uint24) 
+    {
+        // T11: instant decay if duration = 0
+        if (duration == 0 || elapsed >= duration) return base;
+        // T1: linear interpolation
+        uint24 reduction = uint24(uint256(initial - base) * elapsed / duration);
+        return initial - reduction;
+    }
+    
+    /// @notice Governance setter: lower buy-tax ceiling (one-way ratchet).
+    function setBuyTaxOverride(PoolId pid, uint24 newOverride) external onlyGovernance(pid) {
+        _setTaxOverride(pid, true, newOverride);
+    }
+    
+    function setSellTaxOverride(PoolId pid, uint24 newOverride) external onlyGovernance(pid) {
+        _setTaxOverride(pid, false, newOverride);
+    }
+    
+    function _setTaxOverride(PoolId pid, bool isBuy, uint24 newOverride) internal {
+        if (newOverride == 0) revert InvalidTaxConfig();  // T4: 0 reserved for "no override"
+        if (newOverride > MAX_TAX) revert TaxExceedsMax();
+        BuySellTaxConfig storage cfg = _taxConfigs[pid];
+        uint24 old = isBuy ? cfg.manualBuyTax : cfg.manualSellTax;
+        // T9: strictly lower; first set has old=0 so always lower
+        if (old != 0 && newOverride >= old) revert CanOnlyLowerTax();
+        if (isBuy) cfg.manualBuyTax = newOverride;
+        else cfg.manualSellTax = newOverride;
+        emit TaxOverrideSet(pid, isBuy, old, newOverride);
+    }
+    
+    // Views
+    function taxConfigOf(PoolId pid) external view returns (BuySellTaxConfig memory) {
+        return _taxConfigs[pid];
+    }
+    
+    function effectiveBuyTaxOf(PoolId pid) external view returns (uint24);
+    function effectiveSellTaxOf(PoolId pid) external view returns (uint24);
+}
+```
+
+### Integration in main hook
+
+```solidity
+function _beforeSwap(...) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+    PoolId pid = key.toId();
+    EnabledMechanisms memory en = enabled[pid];
+    GovernanceState storage gov = _governance[pid];
+    
+    if (en.antiSnipe) {
+        _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
+    }
+    // ... other modules (M5, M12, M14, etc.)
+    
+    uint24 fee = 0;
+    if (en.tax) {
+        fee = _currentTax(pid, params, gov.tokenIsCurrency0, gov.launchTime);
+        bool isBuy = (params.zeroForOne != gov.tokenIsCurrency0);
+        emit TaxApplied(pid, tx.origin, isBuy, fee);  // T8
+    }
+    
+    return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), fee);
+}
+```
+
+### Test cases (14 tests in `test/mechanisms/BuySellTaxMechanism.t.sol`)
+
+```
+test_init_storesConfig_emitsEvent
+test_init_initialBelowBase_reverts                       (InvalidTaxConfig)
+test_init_initialExceedsMax_reverts                      (TaxExceedsMax)
+test_init_baseExceedsMax_reverts                         (TaxExceedsMax)
+test_init_manualPresetAtBootstrap_reverts                (InvalidTaxConfig)
+test_buy_atLaunchTime_returnsInitialBuyTax
+test_sell_atLaunchTime_returnsInitialSellTax
+test_buy_midDecay_returnsLinearInterpolation
+test_buy_afterDecayDuration_returnsBaseTax
+test_zeroDecayDuration_immediatelyReturnsBase
+test_setBuyTaxOverride_byOwner_succeeds_emitsEvent
+test_setBuyTaxOverride_byNonOwner_reverts                (NotGovernanceOwner)
+test_setBuyTaxOverride_higherThanCurrent_reverts         (CanOnlyLowerTax)
+test_setBuyTaxOverride_thenDecayGoesBelow_usesDecay
+test_postLaunchEnd_setOverride_reverts                   (LaunchEnded)
+```
+
+### Edge cases / notes
+
+- **Tax economics under v1 (no ReturnDelta)**: tax = LP fee. All collected fees go to active LPs at the swap's tick range. Deployer's locked seed LP captures most of this initially. Once unlock conditions met and other LPs join, fees distribute pro-rata.
+- **`decayDuration = 0`**: launch with permanent flat tax (initial fields ignored). Use case: stable assets, RWA pools where tax doesn't decay.
+- **Override mechanics**: setting `setBuyTaxOverride(5_000)` while decay is at 8% → effective drops to 5% immediately. If decay later naturally reaches 3%, effective continues to drop to 3% (min wins). Override doesn't "freeze" tax — it caps it.
+- **Stateless module**: `_currentTax` is `internal view`. No SSTOREs in `_beforeSwap`. Only SLOADs.
+
 ## Parameter Mutability & Lifecycle Phases
 
 ### Mutability matrix
