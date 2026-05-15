@@ -570,19 +570,20 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 | **M2** | `BuySellTaxMechanism` (dynamic LP fee) | `_beforeSwap` (fee override) | **v1** | Mandatory |
 | **M3** | `LiquidityLockMechanism` (incl. vesting) | `_beforeRemoveLiquidity` (revert) | **v1** | Mandatory (was M3+M4 merged) |
 | **M5** | `WhitelistPhaseMechanism` | `_beforeSwap` + `_beforeAddLiquidity` (revert) | **v1** | Optional per-launch |
-| **M9** | `HolderCapMechanism` | `_afterSwap` (track) + `_beforeSwap` (limit) | **v1** | Optional |
 | **M10** | `MinHoldTimeMechanism` (anti-flip) | `_beforeSwap` (track + revert) | **v1** | Optional |
-| **M11** | `AutoBurnMechanism` (% of volume) | `_afterSwap` | **v1** | Optional |
 | **M12** | `InsiderRulesMechanism` (different tax/lock for whitelisted addresses) | `_beforeSwap` | **v1** | Optional |
 | **M13** | `SniperBlacklistMechanism` (block-0 buyer snapshot) | `_afterSwap` (track) + `_beforeSwap` (check) | **v1** | Optional, complements M1 |
 | **M14** | `TradeVolumeCapMechanism` (max % per address) | `_beforeSwap` (track + limit) | **v1** | Optional |
 | **M8** | `TreasuryFeeRoutingMechanism` | `_afterSwap` + `afterSwapReturnDelta` | **v2** | Requires custom accounting; post-allowlist |
 | **M6** | `BondingCurveFallbackMechanism` | `_beforeSwap` + `beforeSwapReturnDelta` | **v2** | Complex math; post-allowlist |
 | **M7** | `AutoBuybackMechanism` | `_afterSwap` + atomic swap | **v2** | Defer to v2 |
+| **M9** | `HolderCapMechanism` | `_afterSwap` (track) + `_beforeSwap` (limit) | **v2** | Deferred — exact holder counting is gas-expensive on-chain; v2 may use off-chain oracle |
+| **M11** | `AutoBurnMechanism` (% of volume) | `_afterSwap` | **v2** | Deferred — interaction with M2 needs design with M8 in scope |
 
 **Merged / dropped:**
 - M4 (Vesting) → merged into M3 (LiquidityLock supports vesting schedule as one of its unlock modes)
-- ~~M6, M7~~ → deferred to v2 (custom-accounting permissions, more design needed)
+- ~~M6, M7, M8~~ → deferred to v2 (custom-accounting permissions, more design needed)
+- ~~M9, M11~~ → deferred to v2 (M9 gas concerns, M11 cross-module design with M8)
 
 ### Per-launch enable flags + presets
 
@@ -591,9 +592,9 @@ Custom UI can offer **presets** that pre-select sensible flag combinations:
 | Preset | Enabled mechanisms |
 |--------|--------------------|
 | **Memecoin** | M1 + M2 + M3 + M13 + M14 |
-| **Fair Launch** | M1 + M2 + M3 + M9 + M14 |
+| **Fair Launch** | M1 + M2 + M3 + M14 |
 | **RWA / Permissioned** | M3 + M5 + M12 |
-| **DAO Token** | M2 + M3 + M11 |
+| **DAO Token** | M2 + M3 |
 | **Custom** | Full toggle UI for all modules |
 
 Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAddLiquidity` from hookData). It's part of the immutable config — cannot be changed post-launch. Within enabled modules, **mutable params** are still adjustable by governance NFT owner.
@@ -613,20 +614,20 @@ Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAd
 
 | File | Module | Status |
 |------|--------|--------|
+| `src/mechanisms/GovernanceModule.sol` | Governance NFT capture + setters (common to all) | v1 mandatory |
 | `src/mechanisms/AntiSnipeMechanism.sol` | M1 — block-window anti-snipe | v1 mandatory |
 | `src/mechanisms/BuySellTaxMechanism.sol` | M2 — asymmetric tax via dynamic LP fee | v1 mandatory |
 | `src/mechanisms/LiquidityLockMechanism.sol` | M3 — conditional + vesting unlock | v1 mandatory |
 | `src/mechanisms/WhitelistPhaseMechanism.sol` | M5 — phased KYC/allowlist access | v1 optional |
-| `src/mechanisms/HolderCapMechanism.sol` | M9 — max-N-holders enforcement | v1 optional |
 | `src/mechanisms/MinHoldTimeMechanism.sol` | M10 — anti-flip cool-down | v1 optional |
-| `src/mechanisms/AutoBurnMechanism.sol` | M11 — % of volume burned | v1 optional |
 | `src/mechanisms/InsiderRulesMechanism.sol` | M12 — separate rules for whitelisted insiders | v1 optional |
 | `src/mechanisms/SniperBlacklistMechanism.sol` | M13 — block-0 buyer blacklist | v1 optional |
 | `src/mechanisms/TradeVolumeCapMechanism.sol` | M14 — max % supply per address | v1 optional |
-| `src/mechanisms/GovernanceModule.sol` | Governance NFT capture + setters (common to all) | v1 mandatory |
 | `src/mechanisms/TreasuryFeeRoutingMechanism.sol` | M8 — fees to treasury via afterSwapReturnDelta | v2 (post-allowlist) |
 | `src/mechanisms/BondingCurveMechanism.sol` | M6 — fallback for thin-liquidity launches | v2 |
 | `src/mechanisms/AutoBuybackMechanism.sol` | M7 — atomic counter-buy on sell pressure | v2 |
+| `src/mechanisms/HolderCapMechanism.sol` | M9 — max-N-holders enforcement | v2 (deferred) |
+| `src/mechanisms/AutoBurnMechanism.sol` | M11 — % of volume burned | v2 (deferred) |
 
 Each mechanism file is a self-contained abstract contract following the [module template](#mechanism-module-template). One test file per module: `test/mechanisms/<Name>Mechanism.t.sol`.
 
@@ -1118,10 +1119,11 @@ Hooks.Permissions({
     - Multisig manager: more professional for serious launches
     - **Recommendation: NFT-only for v1 + `lpRecipient` flexibility (deployer can specify multisig as recipient); add `setManager` for v2.**
 
-11. **Custom accounting (`*ReturnDelta`) — include or exclude?**
-    - Including: full feature set (auto-tax-redirect, bonding curve, auto-buyback) but **requires Uniswap allowlist** before pool routes via Uniswap UI
-    - Excluding: ship without allowlist friction; lose some mechanism elegance (taxes flow to LPs not treasury)
-    - **Recommendation: launch v1 WITH custom accounting + apply for allowlist concurrently. Use fallback distribution (aggregators, own UI) until approved.**
+11. **Custom accounting (`*ReturnDelta`) — include or exclude?** ✅ **DECIDED: include (strategy β)**
+    - Deploy `TokenLaunchHook` with **full permission set up-front** including `beforeSwapReturnDelta` + `afterSwapReturnDelta`
+    - One audit cycle, one Uniswap allowlist application
+    - Same hook contract serves both v1 (no ReturnDelta usage) and v2 (M6 bonding curve, M7 auto-buyback, M8 treasury routing) features
+    - Trade-off accepted: allowlist wait (4-12 weeks) before pool routes via Uniswap UI. Ship via [Fallback Distribution Strategy](#fallback-distribution-strategy) (Phase A — aggregators + own UI) until approval.
 
 ## Risks
 
@@ -1131,7 +1133,7 @@ Hooks.Permissions({
 | Reputation: memecoin scams use our hook | 🔴 High | Position as "fair launch infra"; vet projects via opt-in audit |
 | Regulatory: ICO-like mechanisms = securities | 🔴 High | Geofence US users on frontend; legal review of templates |
 | MEV: sniper bots adapt to our anti-snipe | 🟡 Medium | Continuous iteration; collaborative testing with searchers |
-| Hook contract bug → ALL launches affected (blast radius) | 🔴 High | Single hook = one comprehensive audit (~$80K); bug bounty pre-launch; hook is immutable post-deploy |
+| Hook contract bug → ALL launches affected (blast radius) | 🔴 High | Single hook = one comprehensive audit (~$130K for full ReturnDelta scope); bug bounty pre-launch; hook is immutable post-deploy |
 | Wrapper bug breaks new launches | 🟡 Medium | Old launches still work (only `_beforeAddLiquidity` runs through hook). Deploy new wrapper version, UI updates |
 | Salt mining incorrectness for hook → bad flag bits | 🟡 Medium | Deploy script validates `Hooks.isValidHookAddress` post-deploy |
 | Init race in multi-step deploy (before atomic multicall) | 🟢 Low | `CampaignWrapper` uses atomic multicall — race window = 0 |
@@ -1281,73 +1283,75 @@ Test against live Uniswap V4 PoolManager on Base.
 |-------|----------|-------------|
 | **Pre-coding research** | 1 week | ~~Verify salt convention~~ ✅; salt mining feasibility; Uniswap allowlist process |
 | **Architectural spec lock** | 1 week | Modular structure agreed; main hook skeleton + module template proven |
-| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each module (M1, M2, M3, M5, M9, M10, M11, M12, M13, M14). Each: design doc + interface + open questions resolved |
+| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5, M10, M12, M13, M14). Each: design doc + interface + open questions resolved |
 | **Mandatory modules** (M1-M3) + Governance + Wrapper | 5 weeks | Anti-snipe, tax, lock, governance NFT, atomic launch flow; 90% test coverage |
-| **Optional modules** (M5, M9-M14) | 3 weeks | Each module ~3-4 days incl. tests |
+| **Optional modules** (M5, M10, M12, M13, M14) | 3 weeks | Each module ~3-4 days incl. tests |
 | **Token deployment** (TokenFactory + StandardToken) | 1 week | Cheap ERC-20 clones; integration with Wrapper |
 | **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form with presets; wallet connect; deep links |
-| **Submit Uniswap allowlist application** | — | Parallel with audit; once code is testable on testnet |
-| **Audit** | 4-6 weeks | External audit of hook + wrapper + factory + each module (~$80K); fixes; bug bounty |
-| **Testnet launch + beta** | 4 weeks | Base Sepolia + Unichain Sepolia; 3-5 beta launches with friendly projects |
-| **Mainnet** | — | Deploy on Base/Unichain first (cheap), Arbitrum (good liquidity), Mainnet last |
-| **(v2)** Custom-accounting modules | TBD | M8 (Treasury), M6 (Bonding curve), M7 (Auto-buyback) after allowlist secured |
+| **Submit Uniswap allowlist application** | parallel | Submit ASAP after testnet artifact exists — covers full permission set (incl. `*ReturnDelta`); review typically 4-12 weeks |
+| **Audit** | 4-6 weeks | External audit of hook + wrapper + factory + each module (~$130K — full permission scope incl. ReturnDelta surfaces); fixes; bug bounty |
+| **Testnet launch + beta** | 4 weeks | Base Sepolia + Unichain Sepolia; 3-5 beta launches with friendly projects; use Phase A fallback distribution |
+| **Mainnet ship (via Phase A)** | — | Deploy on Base/Unichain first (cheap), Arbitrum (good liquidity), Mainnet last. **Launches operational via aggregators + our UI** even before Uniswap allowlist resolves |
+| **Allowlist approval** | TBD (parallel) | Once approved, pools auto-route via Uniswap UI (Phase B) — no contract changes |
+| **(v2)** Custom-accounting modules | TBD | M8 (Treasury), M6 (Bonding curve), M7 (Auto-buyback) — code-only additions to existing hook (permissions already enabled) |
 
-**Total to v1 mainnet: ~5-6 months.** Uniswap allowlist may resolve in parallel or post-mainnet (Phase A/B fallback handles either).
+**Total to v1 mainnet: ~5-6 months.** Allowlist approval is parallel — product ships via Phase A regardless. Phase B begins automatically when Uniswap approves.
 
 ## Open Questions for Future Sessions
 
-1. ~~**VERIFY: `salt = bytes32(tokenId)` in V4 PositionManager**~~ ✅ **RESOLVED** — verified in PosM source (lines 298, 343, 379, 431). All liquidity actions use `bytes32(tokenId)` as salt. `nextTokenId` is publicly readable for off-chain prediction.
+### ✅ Resolved
 
-2. **Uniswap allowlist process research**:
-   - What's the application form URL and required materials?
-   - Typical timeline (days/weeks/months)?
-   - Rejection criteria — any documented patterns?
-   - Examples of approved hooks for inspiration?
-   - Apply early (parallel with development) so allowlist isn't sequential
+- ~~`salt = bytes32(tokenId)` in V4 PositionManager~~ — verified at `PositionManager.sol` lines 298, 343, 379, 431. All liquidity actions use this convention. `nextTokenId` is publicly readable for off-chain prediction.
 
-3. **Submit timeline:** if Uniswap allowlist needs 4-12 weeks, when in our dev cycle should we apply? Probably right after testnet deployment + initial audit (so we have something concrete to show).
+- ~~**Hook permission scope**~~ → **Decision: β (Full permission set upfront)**. Deploy `TokenLaunchHook` with all permissions including `beforeSwapReturnDelta` + `afterSwapReturnDelta` from day 1. Trade-off accepted: wait for Uniswap allowlist before pool routing via Uniswap UI; ship via Fallback Distribution (Phase A) until approved. **Reasoning:** single contract serves v1 + v2 features → one audit cycle, one allowlist application, no migration story for existing launches when v2 modules ship. Higher upfront cost (allowlist wait + bigger audit scope) buys long-term operational simplicity.
 
-4. **Anti-sandwich auth: `tx.origin` vs ECDSA signature** — for v1 pick `tx.origin` (most launchers EOA). For v2, design EIP-712 signing flow. Test wallet ecosystem coverage.
+### 🔴 Critical architectural decisions
 
-5. **Salt mining for `TokenLaunchHook` address** — what's typical mining time on commodity hardware (say, MacBook M-series)? If hours, that's fine for one-time deploy. If days, need GPU rig. Test once.
+1. **Per-module deep-dive specs** — each module in [Module catalog](#module-catalog-v1--planned-v2) requires its own session covering:
+   - Storage struct layout (immutable vs mutable fields, slot packing)
+   - Callback invocation order (which module runs first when multiple are enabled)
+   - Governance setter scope (which params mutable, monotone bounds, who can call)
+   - Events for indexer consumption
+   - Per-module test fixtures (mock hook for isolated unit tests)
 
-6. **`PositionManager.multicall` exact API**:
-   - Confirm it forwards `msg.value` across all sub-calls (Multicall_v4 contract pattern)
-   - Confirm `initializePool` works inside multicall (not just `modifyLiquidities`)
-   - Confirm hookData propagates through actions correctly
+2. **Cross-module interaction rules** — concrete cases to nail down before coding:
+   - **Whitelist (M5) + Anti-snipe (M1)**: order in `_beforeSwap`? Likely whitelist first (cheaper revert path).
+   - **Insider rules (M12) + Tax (M2)**: does insider rule override the tax decay schedule for whitelisted addresses?
+   - **Insider (M12) + Anti-snipe (M1)**: are insiders exempt from anti-snipe limits in block 0?
+   - **Trade Volume Cap (M14) + Insider (M12)**: insider addresses exempt from per-address cap?
+   - **Sniper blacklist (M13) + Lock (M3)**: blacklisted seller can't sell but tries to remove liquidity — block via `_beforeRemoveLiquidity` too, or allow withdrawal of principal only?
+   - **Min Hold Time (M10) + Sniper blacklist (M13)**: do these compose or are they alternative anti-flip strategies?
 
-7. **Cross-chain deploy synchronization**: if a token launches on multiple chains, do we want governance NFT to be cross-chain-aware? Probably not for v1 — separate launches per chain.
+### 🔵 v2 architectural decisions (post-v1)
 
-8. **Token deployment via `TokenFactory`**:
-   - Standard ERC-20 with mintable supply to deployer
-   - Should it support optional features (taxable burn, blacklist, etc.) or stay strictly minimal?
-   - **Recommendation: strictly minimal for v1.** Custom ERC-20s = bring-your-own-token via `existingToken`.
+3. **AA wallet support** — ECDSA signature pattern (EIP-712) to replace `tx.origin` check for first-LP authentication. Required for Safe / Argent / Biconomy deployers. Decide signing flow: does wrapper recover signature, does hook recover signature, or off-chain ceremony with on-chain nonce?
 
-9. **Wrapper failure modes**: what if `TokenFactory` deploys but multicall reverts? Token is orphaned (deployed, no pool, no owner mint). Solution: deploy token AFTER multicall succeeds, or use try/catch.
+4. **Sandwich resistance for dynamic tax** (post-allowlist) — fee changing within block can be exploited. Pick approach: commit-reveal scheme? per-block fee freeze? rate limiting? Trade-off between latency and protection.
 
-10. **Allowlist application content**: should we apply for the full permission set (including `*ReturnDelta`) or start minimal and request more later? **Probably full set upfront** — re-applications harder than initial submission.
+5. **v2 module rollout strategy** — adding M6/M7/M8 to existing hook is impossible (immutable). Options when v2 modules are ready:
+   - Deploy entirely new hook with same permissions + new modules → existing pools stay on old hook
+   - Or: design v1 hook with all v2 modules already inherited but disabled via enable flags (only flip on for new launches once Uniswap re-approves) — requires forecasting v2 modules during v1 development
 
-11. **Branding / positioning**: "Fair Launch Infrastructure" vs "Memecoin Pump Tool" — different audiences, risk profiles, allowlist friendliness with Uniswap.
+### 📋 Operational / process (not architectural — track separately)
 
-12. **Integration with existing launchpads**: partnership with PinkSale (they integrate our hook as backend) vs competition? Probably *complementary* — we provide the hook tech, they provide UI distribution.
+These are **not architectural blockers** but need to be done at the right time in the project lifecycle:
 
-13. **Web3 UI tech stack**: Next.js + RainbowKit + Wagmi (standard) vs more specialized memecoin-launch-UX patterns. Out-of-scope for hook architecture but blocks user-facing product.
+| # | Item | When |
+|---|------|------|
+| O1 | Allowlist process research — get application form URL from Uniswap support response; identify required materials (code repo, audit report, testnet deployment, technical writeup) | Before submitting application |
+| O2 | Submit allowlist application | Once testable artifact exists (mid-development) |
+| O3 | Reference PR review — study WETHHook, aggregator hooks PR history in `v4-hooks-public` for clues on review criteria | Anytime before submission |
+| O4 | `PositionManager.multicall` behavioral verification — `initializePool + modifyLiquidities` in one call, `msg.value` forwarded, `hookData` propagation | Before wrapper coding |
+| O5 | Salt mining benchmark — `vm.computeCreate2Address` time on commodity hardware for permission flag bits | Before deploy script |
+| O6 | External audit selection (Spearbit, Trail of Bits, OpenZeppelin, specialized launchpad auditor) | Pre-mainnet |
+| O7 | Testnet deployments (Base Sepolia, Unichain Sepolia) + integration testing | After core code + tests |
 
-14. **Sandwich resistance for dynamic tax** (post-allowlist): tax changing within block can be exploited; add commit-reveal or rate limiting?
+### Not tracked here (out of scope or already decided)
 
-15. **Module-by-module spec drilling**: each mechanism in [Module catalog](#module-catalog-v1--planned-v2) needs its own deep-dive session. Open spec questions per module include:
-    - Exact storage struct layout (immutable vs mutable fields)
-    - Hook callback invocation order (which module runs first?)
-    - Governance setter scope (which params mutable, monotone bounds)
-    - Cross-module interactions (e.g., does M13 SniperBlacklist deny M2 tax? Or apply tax + blacklist sell separately?)
-    - Per-module test fixtures (mock hook for isolated unit tests)
-
-16. **EnabledMechanisms storage** — bit-packed `uint16` vs explicit `struct` with `bool` fields? Bit-pack saves slot but harder to read; explicit struct uses 1 slot anyway if fits in 32 bytes.
-
-17. **Module ordering in inheritance** — Solidity C3 linearization can produce surprises. Pin the order in `TokenLaunchHook` declaration and verify with tests.
-
-18. **Mechanism interaction examples to decide ahead of coding:**
-    - Whitelist (M5) + Anti-snipe (M1): both might revert. Order? Likely whitelist first (gas cheaper if not allowed).
-    - Auto-burn (M11) + Tax (M2): burn % comes off post-tax or pre-tax volume?
-    - Insider (M12) + Tax (M2): does insider rule override the tax decay schedule?
-    - Sniper blacklist (M13) + Lock (M3): if blacklisted seller can't sell but tries to remove liquidity, what happens?
+- Branding / product positioning → product/marketing concern
+- UI tech stack → frontend project, separate doc
+- Launchpad partnerships → business development
+- Token deployment options → decided: strictly minimal ERC-20 via TokenFactory; custom tokens via `existingToken`
+- Wrapper failure modes → decided: deploy token only after multicall succeeds (or use try/catch in wrapper)
+- `tx.origin` vs ECDSA — decided: `tx.origin` for v1, ECDSA in v2 (see Open Design Decisions)
+- EnabledMechanisms storage layout, inheritance ordering — implementation-time details
