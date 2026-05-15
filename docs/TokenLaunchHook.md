@@ -485,28 +485,15 @@ abstract contract <Name>Mechanism {
 }
 ```
 
-### Module catalog (v1 + planned v2)
+### v1 Module catalog
 
-| ID | Module | Hook permissions used | v1 / v2 | Status |
-|----|--------|------------------------|---------|--------|
-| **M1** | `AntiSnipeMechanism` | `_beforeSwap` (revert) | **v1** | Mandatory |
-| **M2** | `BuySellTaxMechanism` (dynamic LP fee) | `_beforeSwap` (fee override) | **v1** | Mandatory |
-| **M3** | `LiquidityLockMechanism` (incl. vesting) | `_beforeRemoveLiquidity` (revert) | **v1** | Mandatory (was M3+M4 merged) |
-| **M5** | `WhitelistPhaseMechanism` | `_beforeSwap` + `_beforeAddLiquidity` (revert) | **v1** | Optional per-launch |
-| **M8** | `TreasuryFeeRoutingMechanism` | `_afterSwap` + `afterSwapReturnDelta` | **v2** | Requires custom accounting; post-allowlist |
-| **M6** | `BondingCurveFallbackMechanism` | `_beforeSwap` + `beforeSwapReturnDelta` | **v2** | Complex math; post-allowlist |
-| **M7** | `AutoBuybackMechanism` | `_afterSwap` + atomic swap | **v2** | Defer to v2 |
-| **M9** | `HolderCapMechanism` | `_afterSwap` (track) + `_beforeSwap` (limit) | **v2** | Deferred — exact holder counting is gas-expensive on-chain; v2 may use off-chain oracle |
-| **M11** | `AutoBurnMechanism` (% of volume) | `_afterSwap` | **v2** | Deferred — interaction with M2 needs design with M8 in scope |
-
-**Merged / dropped:**
-- M4 (Vesting) → merged into M3 (LiquidityLock supports vesting schedule as one of its unlock modes)
-- ~~M6, M7, M8~~ → deferred to v2 (custom-accounting permissions, more design needed)
-- ~~M9, M11~~ → deferred to v2 (M9 gas concerns, M11 cross-module design with M8)
-- ~~M14~~ → removed entirely (cumulative buy cap not pursued)
-- ~~M10~~ → removed entirely (anti-flip not pursued; transfer loophole and DCA penalty made v1 trade-offs unattractive)
-- ~~M13~~ → removed entirely (block-0 buyer blacklist not pursued; transfer loophole limited effectiveness, M1 + M2 deemed sufficient for sniper deterrence)
-- ~~M12~~ → removed entirely (insider rules not pursued; complexity from cross-module overrides, deployer can workaround via M5 whitelist + M2 tax tuning)
+| ID | Module | Hook permissions used | Status |
+|----|--------|------------------------|--------|
+| **Governance** | `GovernanceModule` | `_beforeAddLiquidity` (bootstrap) + `_beforeRemoveLiquidity` (burn protection) | Mandatory |
+| **M1** | `AntiSnipeMechanism` | `_beforeSwap` (revert) | Mandatory |
+| **M2** | `BuySellTaxMechanism` (dynamic LP fee) | `_beforeSwap` (fee override) | Mandatory |
+| **M3** | `LiquidityLockMechanism` | `_beforeRemoveLiquidity` (revert) + `_afterSwap` (volume tracking) | Mandatory |
+| **M5** | `WhitelistPhaseMechanism` | `_beforeSwap` + `_beforeAddLiquidity` (revert) | Optional per-launch |
 
 ### Per-launch enable flags + presets
 
@@ -535,18 +522,13 @@ Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAd
 
 ### Mechanism modules (abstract contracts in `src/mechanisms/`)
 
-| File | Module | Status |
-|------|--------|--------|
-| `src/mechanisms/GovernanceModule.sol` | Governance NFT capture + setters (common to all) | v1 mandatory |
-| `src/mechanisms/AntiSnipeMechanism.sol` | M1 — block-window anti-snipe | v1 mandatory |
-| `src/mechanisms/BuySellTaxMechanism.sol` | M2 — asymmetric tax via dynamic LP fee | v1 mandatory |
-| `src/mechanisms/LiquidityLockMechanism.sol` | M3 — conditional + vesting unlock | v1 mandatory |
-| `src/mechanisms/WhitelistPhaseMechanism.sol` | M5 — phased KYC/allowlist access | v1 optional |
-| `src/mechanisms/TreasuryFeeRoutingMechanism.sol` | M8 — fees to treasury via afterSwapReturnDelta | v2 (post-allowlist) |
-| `src/mechanisms/BondingCurveMechanism.sol` | M6 — fallback for thin-liquidity launches | v2 |
-| `src/mechanisms/AutoBuybackMechanism.sol` | M7 — atomic counter-buy on sell pressure | v2 |
-| `src/mechanisms/HolderCapMechanism.sol` | M9 — max-N-holders enforcement | v2 (deferred) |
-| `src/mechanisms/AutoBurnMechanism.sol` | M11 — % of volume burned | v2 (deferred) |
+| File | Module |
+|------|--------|
+| `src/mechanisms/GovernanceModule.sol` | Governance NFT capture + onlyGovernance modifier |
+| `src/mechanisms/AntiSnipeMechanism.sol` | M1 — time-window anti-snipe |
+| `src/mechanisms/BuySellTaxMechanism.sol` | M2 — asymmetric tax via dynamic LP fee |
+| `src/mechanisms/LiquidityLockMechanism.sol` | M3 — conditional unlock (time + volume) |
+| `src/mechanisms/WhitelistPhaseMechanism.sol` | M5 — phased KYC/allowlist access |
 
 Each mechanism file is a self-contained abstract contract following the [module template](#mechanism-module-template). One test file per module: `test/mechanisms/<Name>Mechanism.t.sol`.
 
@@ -554,8 +536,7 @@ Each mechanism file is a self-contained abstract contract following the [module 
 
 | File | Purpose |
 |------|---------|
-| `src/lib/LaunchMath.sol` | Tax decay curves, time math (pure library shared across modules) |
-| `src/lib/UnlockConditions.sol` | Unlock condition predicates (time, volume, holders, price) |
+| `src/lib/LaunchMath.sol` | Tax linear decay formula (pure library used by M2) |
 | `src/lib/MechanismConfig.sol` | Encoding/decoding helpers for hookData → per-module configs |
 
 ### Deploy scripts
@@ -598,21 +579,6 @@ Cross-cutting infrastructure that:
 2. **Provides** `onlyGovernance(pid)` modifier for all other modules' setters
 3. **Enforces** lifecycle phases (Pre / Active / Frozen)
 4. **Protects** governance NFT from `decreaseLiquidity` and `burn` during active phase
-
-### Design decisions (G1-G10 locked)
-
-| # | Decision |
-|---|----------|
-| G1 | `launchEndTime` immutable (no extension allowed even by gov NFT owner) |
-| G2 | **No `tx.origin == cfg.deployer` check** — unnecessary in atomic wrapper flow; permissionless launches are by-design |
-| G3 | Block both `decreaseLiquidity` AND `burn` for governance NFT until `launchEndTime` |
-| G4 | Allow `transferFrom` of governance NFT in any phase (composability — multisig handoff works) |
-| G5 | First-by-order capture (state flag `initialized` ensures only first mint triggers capture) |
-| G6 | NFT owner only — **always**, no manager delegation feature even in v2 |
-| G7 | `launchDuration` ∈ [1 day, 365 days], enforced via hardcoded constants |
-| G8 | No special handling if gov NFT burned in Phase 2 (post-launch); params already frozen in state |
-| G9 | **No `expectedInitialSqrtPrice` check** — V4's `initializePool` naturally enforces first-init-wins |
-| G10 | Storage packed: 3 slots per pool (tokenId / timestamps+flag / deployer-metadata) |
 
 ### Storage layout (3 slots per pool)
 
@@ -760,7 +726,7 @@ contract TokenLaunchHook is BaseHook, GovernanceModule, /* other modules */ {
     function _beforeInitialize(address, PoolKey calldata, uint160) 
         internal pure override returns (bytes4) 
     {
-        // No-op (G9): V4 protocol enforces first-init-wins
+        // No-op: V4 protocol enforces first-init-wins; config arrives via hookData on first mint
         return this.beforeInitialize.selector;
     }
     
@@ -848,21 +814,6 @@ So `uint256(params.salt)` in our hook callbacks reliably gives the corresponding
 ### Purpose
 
 Prevent sniper bots from grabbing huge portions of token supply in the first N seconds after launch by capping per-TX buy size during a configurable time window. Sells are unrestricted.
-
-### Design decisions (A1-A10 locked)
-
-| # | Decision |
-|---|----------|
-| A1 | Absolute `maxBuyAmountIn` in pair currency (not % of supply — no snapshot needed) |
-| A2 | Restricts BUY direction only; sells unrestricted during window |
-| A3 | Only exact-in swaps allowed during window (exact-out reverts) |
-| A4 | Time-based window (seconds from launchTime), MAX = 1 day |
-| A5 | `tokenIsCurrency0` field added to `GovernanceState` for orientation |
-| A6 | **DROPPED**: per-EOA cooldown tracking — too complex for value provided |
-| A7 | `antiSnipeDuration = 0` → mechanism disabled (skip checks entirely) |
-| A8 | No special "full block-0 ban" flag — set `maxBuyAmountIn = 0` to achieve effective ban |
-| A9 | `maxBuyAmountIn` has no min/max bounds (0 = effective ban, deployer's choice) |
-| A10 | **DROPPED**: aggregator-split tracking — moot after A6 |
 
 ### Configuration (1 slot per pool, immutable post-bootstrap)
 
@@ -983,30 +934,12 @@ test_buy_afterWindowExpires_unrestricted
 - **Window precision**: `block.timestamp` granularity. On L1 ~12s blocks, MAX 1 day → window valid for ~7200 blocks. On L2 sub-second blocks, much finer granularity.
 - **`tokenIsCurrency0` semantics**: `zeroForOne != tokenIsCurrency0` returns `true` iff swap is BUY of our launched token. Proof: if `tokenIsCurrency0=true` and `zeroForOne=false`, we're paying currency1 (pair) to receive currency0 (token) → BUY. Matches the XOR formula.
 - **No state writes** → zero gas overhead from SSTOREs. Only SLOADs for config check.
-- **MAX duration choice (1 day)**: longer than typical memecoin attention span but allows extended fair-launch periods. Easily adjustable via constant if needed in v2.
 
 ## M2 BuySellTaxMechanism — Finalized Spec
 
 ### Purpose
 
 Asymmetric tax via **V4 dynamic LP fee** mechanism. Higher fees on sells (deter dumping), lower on buys (encourage accumulation). Linear decay over time toward a base rate. v1 uses dynamic LP fee only (no `*ReturnDelta`) — fees flow naturally to LP holders. Treasury routing deferred to v2 (M8).
-
-### Design decisions (T1-T12 locked)
-
-| # | Decision |
-|---|----------|
-| T1 | Linear decay curve (initial → base over decayDuration) |
-| T2 | `MAX_TAX = 100_000` V4 units = 10% (sane upper bound) |
-| T3 | Override = ceiling: `effective = min(decayed, manualOverride)` |
-| T4 | `0` = no-override convention for `manualBuyTax`/`manualSellTax` |
-| T5 | `decayDuration` immutable in v1 (only overrides mutable) |
-| T6 | 100% of fees to LPs in v1; v2 adds M8 TreasuryRouting |
-| T7 | Single shared `decayDuration` for both buy/sell directions |
-| T8 | `TaxApplied` event per swap (indexed fields only — cheap, indexer-friendly) |
-| T9 | Override capped at `MAX_TAX`; must strictly lower current override (one-way ratchet) |
-| T10 | At `elapsed = 0`: returns `initialTax` (linear formula yields initial - 0) |
-| T11 | `decayDuration = 0` → instant decay; effective = baseTax always (static-tax launches) |
-| T12 | Manual overrides packed in same config struct (1 slot total) |
 
 ### Units
 
@@ -1021,14 +954,14 @@ Using `uint24` directly matches V4 fee type — no conversion needed at hook cal
 
 ```solidity
 struct BuySellTaxConfig {
-    // ─── Immutable post-bootstrap (T5) ───
+    // ─── Immutable post-bootstrap ───
     uint24 initialBuyTax;       // V4 fee units, capped at MAX_TAX
     uint24 initialSellTax;
     uint24 baseTax;             // final tax after decay (or always if decayDuration=0)
     uint32 decayDuration;       // seconds (0 = instant decay to baseTax)
     
     // ─── Mutable by governance, one-way ratchet down (T3, T9) ───
-    uint24 manualBuyTax;        // 0 = no override (T4)
+    uint24 manualBuyTax;        // 0 = no override
     uint24 manualSellTax;
     
     // Total: 24×5 + 32 = 152 bits = 19 bytes → fits in 1 slot ✓
@@ -1203,31 +1136,13 @@ test_postLaunchEnd_setOverride_reverts                   (LaunchEnded)
 
 Provides **conditional unlock** for the governance NFT (deployer's seed LP). Extends GovernanceModule's simple time-based burn protection (`launchEndTime` from G3) with richer criteria: cumulative volume threshold, combined logic.
 
-**Relationship with Governance burn protection (G3):**
-- Governance G3: blocks `decreaseLiquidity` / `burn` of gov NFT until `launchEndTime` — **always applies** (whether M3 enabled or not)
+**Relationship with Governance burn protection:**
+- GovernanceModule: blocks `decreaseLiquidity` / `burn` of gov NFT until `launchEndTime` — **always applies** (whether M3 enabled or not)
 - M3: **additional** check on top — when enabled, both conditions must pass
 
 Result: `launchEndTime` is the **minimum lock duration**, M3 extends it with stricter requirements.
 
-**Scope (v1):** M3 applies ONLY to governance NFT (L8). Other LP NFTs (joining after launch) are free to add/remove anytime. Avoids overly-restrictive UX for retail LPs.
-
-### Design decisions (L1-L13 locked)
-
-| # | Decision |
-|---|----------|
-| L1 | v1 supports TIME + VOLUME conditions; HOLDERS and PRICE_FLOOR deferred to v2 |
-| L2 | Logic mode (AND / OR) selectable at bootstrap |
-| L3 | Mutability: time/volume thresholds only DECREASE; conditions can DISABLE; AND→OR one-way |
-| L4 | At least one condition must remain enabled at all times |
-| L5 | Volume tracked every swap (no threshold) |
-| L6 | Total bidirectional volume (both buys and sells contribute) |
-| L7 | Volume measured in pair-currency units (e.g., WETH wei) |
-| L8 | M3 applies only to governance NFT in v1; other LP NFTs unrestricted |
-| L9 | M3 conditions are AND with Governance G3: `unlockAllowed = launchEnded AND m3Met` |
-| L10 | No reachability check on volume threshold (deployer's responsibility) |
-| L11 | `unlockTime >= launchEndTime` enforced at init |
-| L12 | Cumulative volume never reset (lifetime pool metric) |
-| L13 | Verbose events (relax/disable/switch) for indexer consumption |
+**Scope:** M3 applies ONLY to governance NFT. Other LP NFTs (joining after launch) are free to add/remove anytime. Avoids overly-restrictive UX for retail LPs.
 
 ### Configuration (2 slots per pool)
 
@@ -1439,7 +1354,7 @@ test_disableTimeCondition_keepsVolumeActive
 test_disableLastCondition_reverts                    (MustKeepOneCondition)
 test_switchToOr_changesLogic_emitsEvent
 test_switchToOr_alreadyOr_reverts                    (AlreadyOr)
-test_nonGovNFT_removeLiquidity_unrestricted          (L8)
+test_nonGovNFT_removeLiquidity_unrestricted
 ```
 
 ### Edge cases / notes
@@ -1448,34 +1363,18 @@ test_nonGovNFT_removeLiquidity_unrestricted          (L8)
 - **Cumulative metric**: volume never resets, even after unlock. Allows tracking lifetime activity for analytics.
 - **AND→OR one-way ratchet**: gov cannot tighten by reverting OR→AND. Once relaxed, stays relaxed.
 - **Edge case: relax to current `block.timestamp`**: `newTime < cfg.unlockTime` allows setting to `block.timestamp - 1`, effectively "unlock now if other conditions met". Useful for emergency unlock.
-- **No "reachability check" on volumeThreshold (L10)**: deployer could set `unlockVolumeThreshold = type(uint128).max` → effectively never unlocks via volume. That's their choice; gov can lower if mistake.
+- **No "reachability check" on volumeThreshold**: deployer could set `unlockVolumeThreshold = type(uint128).max` → effectively never unlocks via volume. That's their choice; gov can lower if mistake.
 
 ## M5 WhitelistPhaseMechanism — Finalized Spec
 
 ### Purpose
 
-Phased access control: only **whitelisted addresses** can interact with the pool (buys, sells, LP adds) until a configurable end time. After endTime expires, restrictions lift entirely. Removal of liquidity (`decreaseLiquidity` / `burn`) is **always** allowed even for non-whitelisted addresses — anyone with a position can exit (W11).
+Phased access control: only **whitelisted addresses** can interact with the pool (buys, sells, LP adds) until a configurable end time. After endTime expires, restrictions lift entirely. Removal of liquidity (`decreaseLiquidity` / `burn`) is **always** allowed even for non-whitelisted addresses — anyone with a position can exit.
 
 **Use cases:**
 - **RWA / Permissioned**: KYC required for trading. `whitelistEndTime = launchEndTime` for full launch protection.
 - **Fair launch**: early-access for community members. Whitelist for first hours/days, then open.
 - **ICO-like presale**: only pre-sale participants buy early.
-
-### Design decisions (W1-W12 locked)
-
-| # | Decision |
-|---|----------|
-| W1 | **DIRECT mode only** — in-hook mapping, no external oracle. EXTERNAL_ORACLE and MERKLE deferred to v2. |
-| W2 | Single boundary (`whitelistEndTime`). Multi-phase deferred to v2. |
-| W3 | **No granular flags.** Whitelist gates ALL actions (buys, sells, LP adds) — simpler, no edge cases. |
-| W4 | Gov can both ADD and REMOVE addresses. Both emit events. Batch versions provided. |
-| W5 | N/A (no oracle anymore — W1) |
-| W6 | N/A (no oracle anymore — W1) |
-| W7 + W8 | `whitelistEndTime ∈ (launchTime, launchEndTime]`. Whitelist phase bounded by launch lifecycle. |
-| W9 | `tx.origin` for whitelist check (AA limitation noted; v2 fix via signature). |
-| W10 | Batch `addManyToWhitelist` / `removeManyFromWhitelist` for bulk operations. |
-| W11 | Removing liquidity always allowed (even for non-whitelisted). Allows position exit. |
-| W12 | N/A (no per-action flags — W3) |
 
 ### Configuration (1 slot per pool, 8 bytes used)
 
@@ -1507,7 +1406,7 @@ function _checkWhitelist(PoolId pid) internal view {
 }
 ```
 
-Single check covers all gated actions (W3). Applied to:
+Single check covers all gated actions. Applied to:
 - `_beforeSwap`: catches both buys and sells
 - `_beforeAddLiquidity`: catches LP adds (except bootstrap — see Integration)
 
@@ -1603,7 +1502,7 @@ function _beforeSwap(...) internal override returns (bytes4, BeforeSwapDelta, ui
     EnabledMechanisms memory en = enabled[pid];
     GovernanceState storage gov = _governance[pid];
     
-    if (en.whitelist) _checkWhitelist(pid);           // gates BOTH directions (W3)
+    if (en.whitelist) _checkWhitelist(pid);           // gates BOTH swap directions
     if (en.antiSnipe) _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
     // ...
     
@@ -1623,7 +1522,7 @@ function _beforeAddLiquidity(...) internal override returns (bytes4) {
     }
     
     EnabledMechanisms memory en = enabled[pid];
-    if (en.whitelist) _checkWhitelist(pid);           // gates LP adds (W3)
+    if (en.whitelist) _checkWhitelist(pid);           // gates LP adds
     
     return this.beforeAddLiquidity.selector;
 }
@@ -1643,7 +1542,7 @@ test_whitelisted_canAddLiquidity
 test_nonWhitelisted_cannotBuy                            (NotWhitelisted)
 test_nonWhitelisted_cannotSell                           (NotWhitelisted)
 test_nonWhitelisted_cannotAddLiquidity                   (NotWhitelisted)
-test_nonWhitelisted_canAlwaysRemoveLiquidity             (W11)
+test_nonWhitelisted_canAlwaysRemoveLiquidity
 test_afterEndTime_unrestricted_evenNonWhitelisted
 test_bootstrap_skipsWhitelistCheck                       (deployer doesn't need to be whitelisted)
 test_addToWhitelist_byOwner_succeeds_emitsEvent
@@ -1658,7 +1557,7 @@ test_relaxEndTime_laterThanCurrent_reverts               (CanOnlyRelax)
 ### Edge cases / notes
 
 - **Bootstrap path bypass**: at first mint, `state.initialized == false` → governance init runs and module init configures whitelist. Deployer's first mint doesn't require their address to be whitelisted (they configure the list during the same atomic TX).
-- **Whitelist bounded by launch lifecycle (W7+W8)**: `whitelistEndTime` is in `(launchTime, launchEndTime]`. After `launchEndTime`, governance phase is frozen anyway — whitelist must conclude by then. For "RWA permanent gating", deployer sets `launchDuration = 365 days` (MAX from G7) and `whitelistEndTime = launchTime + 365 days`. v2 may revisit unbounded whitelists.
+- **Whitelist bounded by launch lifecycle**: `whitelistEndTime` is in `(launchTime, launchEndTime]`. After `launchEndTime`, governance phase is frozen anyway — whitelist must conclude by then. For "RWA permanent gating", deployer sets `launchDuration = 365 days` (MAX) and `whitelistEndTime = launchTime + 365 days`.
 - **Storage growth**: each whitelisted address consumes 1 slot. For a launch with 10,000 KYC'd users, that's 10K SSTOREs at bootstrap or via batch — costly. Recommendation: use `addManyToWhitelist` in chunks of 100-200 per TX to manage gas.
 - **W11 rationale**: removing liquidity is asset withdrawal. Blocking it could trap user funds. Even if a user gets removed from whitelist (after adding liquidity earlier), they can still exit. M3 LiquidityLock separately protects the governance NFT — that's deployer's own LP, not third-party LPs.
 - **Bootstrap multicall order**: in `CampaignWrapper.launchCampaign`, after governance bootstrap completes, the wrapper can immediately call `addManyToWhitelist` for the initial KYC list — all in same atomic launch TX.
