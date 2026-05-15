@@ -789,129 +789,247 @@ Implemented via `BeforeSwapDelta` adjustments in `_beforeSwap`.
 - Atomic buyback inside the sell TX (counter-buy)
 - Stabilizes price during panic dumps
 
-## Governance: First-Position NFT Pattern (per-PoolId)
+## GovernanceModule — Finalized Spec
 
-Each launch needs **ongoing parameter management** (decay tax rates, extend lock time, etc.). To avoid centralized admin keys, governance is bound to the **NFT of the first position** in each pool. Whoever owns that NFT controls **that launch's** parameters within bounded scope.
+### Purpose
 
-Since one `TokenLaunchHook` serves many pools, governance state is **per-PoolId** in storage:
+Cross-cutting infrastructure that:
+1. **Captures** the first LP NFT in each pool as the governance NFT (in `_beforeAddLiquidity`)
+2. **Provides** `onlyGovernance(pid)` modifier for all other modules' setters
+3. **Enforces** lifecycle phases (Pre / Active / Frozen)
+4. **Protects** governance NFT from `decreaseLiquidity` and `burn` during active phase
+
+### Design decisions (G1-G10 locked)
+
+| # | Decision |
+|---|----------|
+| G1 | `launchEndTime` immutable (no extension allowed even by gov NFT owner) |
+| G2 | **No `tx.origin == cfg.deployer` check** — unnecessary in atomic wrapper flow; permissionless launches are by-design |
+| G3 | Block both `decreaseLiquidity` AND `burn` for governance NFT until `launchEndTime` |
+| G4 | Allow `transferFrom` of governance NFT in any phase (composability — multisig handoff works) |
+| G5 | First-by-order capture (state flag `initialized` ensures only first mint triggers capture) |
+| G6 | NFT owner only — **always**, no manager delegation feature even in v2 |
+| G7 | `launchDuration` ∈ [1 day, 365 days], enforced via hardcoded constants |
+| G8 | No special handling if gov NFT burned in Phase 2 (post-launch); params already frozen in state |
+| G9 | **No `expectedInitialSqrtPrice` check** — V4's `initializePool` naturally enforces first-init-wins |
+| G10 | Storage packed: 3 slots per pool (tokenId / timestamps+flag / deployer-metadata) |
+
+### Storage layout (3 slots per pool)
 
 ```solidity
-struct CampaignState {
-    LaunchConfig config;
-    uint256 governanceTokenId;
-    uint256 cumulativeVolume;
-    uint32 uniqueHolders;
-    bool initialized;
+struct GovernanceState {
+    // slot 0 (32 bytes)
+    uint256 tokenId;                  // captured at first-mint; salt = bytes32(tokenId)
+    
+    // slot 1 (19 bytes used of 32)
+    uint64 launchTime;                // bootstrap timestamp
+    uint64 launchEndTime;             // governance freeze deadline (immutable)
+    bool   initialized;               // bootstrap flag (per G5: only first mint flips this)
+    bool   tokenIsCurrency0;          // orientation: is launched token currency0 in PoolKey?
+    
+    // slot 2 (20 bytes of 32)
+    address deployer;                 // metadata only — not used for authorization (per G2)
 }
 
-mapping(PoolId => CampaignState) public campaigns;
+mapping(PoolId => GovernanceState) internal _governance;
+```
 
-struct LaunchConfig {
-    // — Immutable (set at first-mint bootstrap) —
-    address deployer;                  // who launched (msg.sender of CampaignWrapper)
-    address tokenAddress;
-    uint160 expectedInitialSqrtPrice;
-    uint64 launchTime;
-    uint64 launchEndTime;              // governance freeze time
-    uint32 antiSnipeBlocks;
-    uint16 maxBuyBpsPerBlock;
-    // — Mutable by governance NFT owner (bounded) —
-    uint16 buyTaxBps;
-    uint16 sellTaxBps;
-    uint16 baseTaxBps;
-    uint32 taxDecayPeriod;
-    UnlockMode unlockMode;
-    uint256 unlockTime;
-    uint256 unlockVolumeThreshold;
-    uint32 unlockHolderThreshold;
-    // ... etc
+`tokenIsCurrency0` is cross-cutting metadata used by other modules (M1 AntiSnipe, M2 BuySellTax, etc.) to determine swap direction (BUY vs SELL of the launched token).
+
+### Bootstrap config (encoded into hookData on first mint)
+
+```solidity
+struct GovernanceInitConfig {
+    address deployer;            // metadata; set by CampaignWrapper = msg.sender
+    uint64  launchDuration;      // seconds; must be in [MIN_DURATION, MAX_DURATION]
+    bool    tokenIsCurrency0;    // set by CampaignWrapper based on PoolKey sorting
 }
 ```
 
-### Capture flow
+Constants:
+```solidity
+uint64 internal constant MIN_LAUNCH_DURATION = 1 days;
+uint64 internal constant MAX_LAUNCH_DURATION = 365 days;
+```
 
-Because pool initialization doesn't accept hookData, all setup happens at the **first add-liquidity** call. `CampaignWrapper`'s atomic multicall ensures init and first-mint are in the same TX → no race window.
+### Skeleton
 
 ```solidity
-function _beforeInitialize(address, PoolKey calldata, uint160) 
-    internal pure override returns (bytes4) 
-{
-    // Blank — wait for hookData on first mint
-    return this.beforeInitialize.selector;
-}
-
-function _beforeAddLiquidity(
-    address sender, 
-    PoolKey calldata key,
-    ModifyLiquidityParams calldata params,
-    bytes calldata hookData
-) internal override returns (bytes4) {
-    PoolId pid = key.toId();
-    CampaignState storage state = campaigns[pid];
+abstract contract GovernanceModule {
+    address public immutable POSITION_MANAGER;
+    mapping(PoolId => GovernanceState) internal _governance;
     
-    if (!state.initialized) {
-        // FIRST mint — bootstrap campaign
-        require(sender == POSITION_MANAGER, "Must mint via PositionManager");
-        
-        LaunchConfig memory cfg = abi.decode(hookData, (LaunchConfig));
-        
-        // Anti-griefing: verify init price matches what wrapper declared
-        (uint160 sqrtNow,,,) = poolManager.getSlot0(pid);
-        require(sqrtNow == cfg.expectedInitialSqrtPrice, "Wrong init price");
-        
-        // Anti-sandwich: only deployer's wallet can do first mint
-        require(tx.origin == cfg.deployer, "Wrong first LP");
-        
-        // Capture governance NFT via salt = bytes32(tokenId) convention (verified in PosM)
-        state.config = cfg;
-        state.governanceTokenId = uint256(params.salt);
-        state.initialized = true;
-        
-        emit CampaignBootstrapped(pid, cfg.deployer, state.governanceTokenId);
-    } else {
-        // Subsequent — apply launch rules
-        _applyAddLiquidityRules(state, sender, params);
+    error NotInitialized();
+    error AlreadyInitialized();
+    error LaunchEnded();
+    error NotGovernanceOwner();
+    error MustUsePositionManager();
+    error CannotBurnGovernanceNFT();
+    error InvalidLaunchDuration();
+    
+    event CampaignBootstrapped(
+        PoolId indexed pid,
+        address indexed deployer,
+        uint256 governanceTokenId,
+        uint64 launchTime,
+        uint64 launchEndTime
+    );
+    
+    constructor(address _posm) {
+        POSITION_MANAGER = _posm;
     }
     
-    return this.beforeAddLiquidity.selector;
+    modifier onlyGovernance(PoolId pid) {
+        GovernanceState storage state = _governance[pid];
+        if (!state.initialized) revert NotInitialized();
+        if (block.timestamp >= state.launchEndTime) revert LaunchEnded();
+        if (IERC721(POSITION_MANAGER).ownerOf(state.tokenId) != msg.sender) {
+            revert NotGovernanceOwner();
+        }
+        _;
+    }
+    
+    // Called from main hook's _beforeAddLiquidity on FIRST mint per pool
+    function _initGovernance(
+        PoolId pid, 
+        ModifyLiquidityParams calldata params,
+        GovernanceInitConfig memory cfg,
+        address sender
+    ) internal {
+        GovernanceState storage state = _governance[pid];
+        if (state.initialized) revert AlreadyInitialized();
+        if (sender != POSITION_MANAGER) revert MustUsePositionManager();
+        if (cfg.launchDuration < MIN_LAUNCH_DURATION || cfg.launchDuration > MAX_LAUNCH_DURATION) {
+            revert InvalidLaunchDuration();
+        }
+        
+        // Salt = bytes32(tokenId) — verified PosM convention
+        state.tokenId = uint256(params.salt);
+        state.deployer = cfg.deployer;                  // metadata, no auth
+        state.tokenIsCurrency0 = cfg.tokenIsCurrency0;  // orientation for other modules
+        state.launchTime = uint64(block.timestamp);
+        state.launchEndTime = uint64(block.timestamp) + cfg.launchDuration;
+        state.initialized = true;
+        
+        emit CampaignBootstrapped(
+            pid, cfg.deployer, state.tokenId, state.launchTime, state.launchEndTime
+        );
+    }
+    
+    // Called from main hook's _beforeRemoveLiquidity (G3: block decrease AND burn)
+    function _checkBurnProtection(PoolId pid, ModifyLiquidityParams calldata params) 
+        internal view 
+    {
+        GovernanceState storage state = _governance[pid];
+        if (
+            state.initialized &&
+            uint256(params.salt) == state.tokenId &&
+            block.timestamp < state.launchEndTime
+        ) {
+            revert CannotBurnGovernanceNFT();
+        }
+    }
+    
+    // Views
+    function governanceTokenIdOf(PoolId pid) external view returns (uint256) {
+        return _governance[pid].tokenId;
+    }
+    
+    function governanceOwnerOf(PoolId pid) external view returns (address) {
+        GovernanceState storage state = _governance[pid];
+        return state.initialized 
+            ? IERC721(POSITION_MANAGER).ownerOf(state.tokenId) 
+            : address(0);
+    }
+    
+    function launchPhaseOf(PoolId pid) external view returns (uint8) {
+        // 0 = Pre-launch, 1 = Active, 2 = Frozen
+        GovernanceState storage state = _governance[pid];
+        if (!state.initialized) return 0;
+        if (block.timestamp < state.launchEndTime) return 1;
+        return 2;
+    }
 }
-
-modifier onlyGovernance(PoolId pid) {
-    CampaignState storage state = campaigns[pid];
-    require(state.initialized, "No campaign");
-    require(block.timestamp < state.config.launchEndTime, "Launch ended — params frozen");
-    require(
-        IERC721(POSITION_MANAGER).ownerOf(state.governanceTokenId) == msg.sender,
-        "Not governance NFT owner"
-    );
-    _;
-}
-
-function setBuyTax(PoolId pid, uint16 newBps) external onlyGovernance(pid) {
-    CampaignState storage state = campaigns[pid];
-    require(newBps <= state.config.buyTaxBps, "Can only decrease");
-    state.config.buyTaxBps = newBps;
-    emit ParamUpdated(pid, "buyTaxBps", newBps);
-}
-
-// ... more setters per Mutability matrix
 ```
 
-### Anti-sandwich protection on first mint
+### Integration in main hook callbacks
 
-Because the entire launch happens in one atomic `CampaignWrapper.launchCampaign` TX, the race window between init and first-mint is **0 blocks**. But defense in depth:
+```solidity
+contract TokenLaunchHook is BaseHook, GovernanceModule, /* other modules */ {
+    
+    function _beforeInitialize(address, PoolKey calldata, uint160) 
+        internal pure override returns (bytes4) 
+    {
+        // No-op (G9): V4 protocol enforces first-init-wins
+        return this.beforeInitialize.selector;
+    }
+    
+    function _beforeAddLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        bytes calldata hookData
+    ) internal override returns (bytes4) {
+        PoolId pid = key.toId();
+        
+        if (!_governance[pid].initialized) {
+            // First mint — bootstrap (G5: first-by-order)
+            (GovernanceInitConfig memory govCfg, /* other module configs */) = 
+                abi.decode(hookData, (GovernanceInitConfig /*, ...*/));
+            _initGovernance(pid, params, govCfg, sender);
+            // ... initialize other enabled modules
+        } else {
+            // Subsequent mints — apply launch rules from each enabled module
+            // ...
+        }
+        
+        return this.beforeAddLiquidity.selector;
+    }
+    
+    function _beforeRemoveLiquidity(
+        address sender,
+        PoolKey calldata key,
+        ModifyLiquidityParams calldata params,
+        bytes calldata
+    ) internal override returns (bytes4) {
+        PoolId pid = key.toId();
+        _checkBurnProtection(pid, params);  // G3
+        // ... dispatch to M3 LiquidityLock check for other LP NFTs
+        return this.beforeRemoveLiquidity.selector;
+    }
+}
+```
 
-**Layer A: `tx.origin == cfg.deployer` (basic)**
+### Test cases (15 tests in `test/mechanisms/GovernanceModule.t.sol`)
 
-Simple, works for EOA deployers. Breaks under EIP-7702 / ERC-4337 AA wallets (where `tx.origin` ≠ effective signer).
+```
+test_init_bootstrap_capturesGovNFT_emitsEvent
+test_init_nonPosM_reverts                          (MustUsePositionManager)
+test_init_duplicate_reverts                        (AlreadyInitialized)
+test_init_durationTooShort_reverts                 (InvalidLaunchDuration)
+test_init_durationTooLong_reverts                  (InvalidLaunchDuration)
+test_onlyGovernance_correctOwner_passes
+test_onlyGovernance_wrongCaller_reverts            (NotGovernanceOwner)
+test_onlyGovernance_uninitialized_reverts          (NotInitialized)
+test_onlyGovernance_postLaunchEnd_reverts          (LaunchEnded)
+test_onlyGovernance_afterNFTTransfer_newOwnerHasAccess
+test_burnProtection_govNFT_inPhase1_reverts        (CannotBurnGovernanceNFT)
+test_burnProtection_govNFT_inPhase2_allows
+test_burnProtection_nonGovNFT_inPhase1_allows
+test_launchPhaseOf_returnsCorrectPhase
+test_multiplePositionsFirstMulticall_onlyFirstCapturesGov
+```
 
-**Layer B: ECDSA signature in hookData (AA-safe, recommended for v2)**
+### Front-running considerations
 
-Deployer signs EIP-712 message off-chain. Submitted via hookData. Hook recovers signer and compares to `cfg.deployer`. Works under any wallet stack.
+The atomic `CampaignWrapper.launchCampaign` flow means **no race window WITHIN the TX**: init + first mint are bundled, no actor can intervene mid-multicall.
 
-**Layer C: Atomic multicall via CampaignWrapper**
+However, **the wrapper call itself** can be front-run from mempool:
+- Attacker sees pending `launchCampaign(params)` 
+- Submits competing call with same params + higher gas
+- Attacker becomes deployer of "their version" of the launch
 
-The primary defense. Wrapper bundles `initializePool + modifyLiquidities` in one TX → no in-flight state for attackers to exploit. `msg.sender` is the wrapper, `tx.origin` is the human deployer.
+**Mitigation:** this is grief, not theft. Attacker pays full seed liquidity for their own launch with their own (cloned) token. Original deployer can either (a) launch on slightly different PoolKey (different `tickSpacing`/`fee`), or (b) use private mempool (Flashbots) / commit-reveal pattern for high-value launches. Documented as known limitation; v2 may add commit-reveal scheme.
 
 ### Salt = tokenId convention ✅ VERIFIED
 
@@ -941,6 +1059,148 @@ So `uint256(params.salt)` in our hook callbacks reliably gives the corresponding
 - A timelock contract for additional rug-pull protection
 
 The hook only checks **ownership** of the gov NFT — not who minted it. So transferring/holding via any of the above works seamlessly. The recipient address is passed as `recipient` argument inside the `MINT_POSITION` action.
+
+## M1 AntiSnipeMechanism — Finalized Spec
+
+### Purpose
+
+Prevent sniper bots from grabbing huge portions of token supply in the first N seconds after launch by capping per-TX buy size during a configurable time window. Sells are unrestricted (sniper sell-side handled by M13 SniperBlacklist separately).
+
+### Design decisions (A1-A10 locked)
+
+| # | Decision |
+|---|----------|
+| A1 | Absolute `maxBuyAmountIn` in pair currency (not % of supply — no snapshot needed) |
+| A2 | Restricts BUY direction only; sells unrestricted during window |
+| A3 | Only exact-in swaps allowed during window (exact-out reverts) |
+| A4 | Time-based window (seconds from launchTime), MAX = 1 day |
+| A5 | `tokenIsCurrency0` field added to `GovernanceState` for orientation |
+| A6 | **DROPPED**: per-EOA cooldown tracking — too complex for value provided |
+| A7 | `antiSnipeDuration = 0` → mechanism disabled (skip checks entirely) |
+| A8 | No special "full block-0 ban" flag — set `maxBuyAmountIn = 0` to achieve effective ban |
+| A9 | `maxBuyAmountIn` has no min/max bounds (0 = effective ban, deployer's choice) |
+| A10 | **DROPPED**: aggregator-split tracking — moot after A6 |
+
+### Configuration (1 slot per pool, immutable post-bootstrap)
+
+```solidity
+struct AntiSnipeConfig {
+    uint32  antiSnipeDuration;     // seconds (0 = disabled), MAX = 1 day
+    uint128 maxBuyAmountIn;        // max input per buy TX, in pair-currency wei (0 = effective ban)
+    // 32 + 128 = 160 bits = 20 bytes → fits in 1 slot
+}
+
+mapping(PoolId => AntiSnipeConfig) internal _antiSnipeConfigs;
+// NO runtime state — module is stateless (A6 drop removed per-EOA cooldown)
+```
+
+### Constants
+
+```solidity
+uint32 internal constant MAX_ANTISNIPE_DURATION = 1 days;
+```
+
+### Skeleton
+
+```solidity
+abstract contract AntiSnipeMechanism {
+    mapping(PoolId => AntiSnipeConfig) internal _antiSnipeConfigs;
+    
+    error InvalidAntiSnipeDuration();
+    error ExactOutNotAllowedDuringAntiSnipe();
+    error BuyTooLarge();
+    
+    event AntiSnipeInitialized(PoolId indexed pid, AntiSnipeConfig cfg);
+    
+    function _initAntiSnipe(PoolId pid, AntiSnipeConfig memory cfg) internal {
+        if (cfg.antiSnipeDuration > MAX_ANTISNIPE_DURATION) revert InvalidAntiSnipeDuration();
+        _antiSnipeConfigs[pid] = cfg;
+        emit AntiSnipeInitialized(pid, cfg);
+    }
+    
+    /// @notice Called from main hook's _beforeSwap when AntiSnipe is enabled for this pool.
+    /// @dev Stateless — no SSTOREs. View-only.
+    function _checkAntiSnipe(
+        PoolId pid,
+        SwapParams calldata params,
+        bool tokenIsCurrency0,
+        uint64 launchTime
+    ) internal view {
+        AntiSnipeConfig storage cfg = _antiSnipeConfigs[pid];
+        
+        // Disabled or window expired → no restrictions
+        if (cfg.antiSnipeDuration == 0) return;
+        if (block.timestamp >= launchTime + cfg.antiSnipeDuration) return;
+        
+        // Sells unrestricted during anti-snipe window (M13 handles sniper sells)
+        bool isBuy = (params.zeroForOne != tokenIsCurrency0);
+        if (!isBuy) return;
+        
+        // Only exact-in during window (exact-out makes input size unpredictable)
+        if (params.amountSpecified > 0) revert ExactOutNotAllowedDuringAntiSnipe();
+        
+        // Cap on input amount in pair currency
+        uint256 amountIn = uint256(-params.amountSpecified);
+        if (amountIn > cfg.maxBuyAmountIn) revert BuyTooLarge();
+    }
+    
+    function antiSnipeConfigOf(PoolId pid) external view returns (AntiSnipeConfig memory) {
+        return _antiSnipeConfigs[pid];
+    }
+}
+```
+
+### Integration in main hook
+
+```solidity
+function _beforeSwap(
+    address /*sender*/,
+    PoolKey calldata key,
+    SwapParams calldata params,
+    bytes calldata /*hookData*/
+) internal override returns (bytes4, BeforeSwapDelta, uint24) {
+    PoolId pid = key.toId();
+    EnabledMechanisms memory en = enabled[pid];
+    GovernanceState storage gov = _governance[pid];
+    
+    if (en.antiSnipe) {
+        _checkAntiSnipe(pid, params, gov.tokenIsCurrency0, gov.launchTime);
+    }
+    // ... dispatch to other modules (M5, M12, M14, etc.)
+    
+    uint24 fee = en.tax ? _calculateTax(pid, params, gov) : 0;
+    return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), fee);
+}
+```
+
+Inside `_beforeAddLiquidity` bootstrap (called from `_initGovernance` flow):
+```solidity
+if (en.antiSnipe) {
+    AntiSnipeConfig memory asCfg = abi.decode(hookData[offsetAntiSnipe:], (AntiSnipeConfig));
+    _initAntiSnipe(pid, asCfg);
+}
+```
+
+### Test cases (8 tests in `test/mechanisms/AntiSnipeMechanism.t.sol`)
+
+```
+test_init_storesConfig_emitsEvent
+test_init_durationExceedsMax_reverts        (InvalidAntiSnipeDuration)
+test_disabled_skipsCheck                     (antiSnipeDuration = 0)
+test_buy_withinLimits_passes
+test_buy_exceedsMaxAmount_reverts            (BuyTooLarge)
+test_buy_exactOut_reverts                    (ExactOutNotAllowedDuringAntiSnipe)
+test_sell_unrestricted_duringWindow
+test_buy_afterWindowExpires_unrestricted
+```
+
+### Edge cases / notes
+
+- **`maxBuyAmountIn = 0`** → effective block-0 ban (every buy attempt fails `amountIn > 0` check). Deployer's lever for strict mode.
+- **Window precision**: `block.timestamp` granularity. On L1 ~12s blocks, MAX 1 day → window valid for ~7200 blocks. On L2 sub-second blocks, much finer granularity.
+- **`tokenIsCurrency0` semantics**: `zeroForOne != tokenIsCurrency0` returns `true` iff swap is BUY of our launched token. Proof: if `tokenIsCurrency0=true` and `zeroForOne=false`, we're paying currency1 (pair) to receive currency0 (token) → BUY. Matches the XOR formula.
+- **No state writes** → zero gas overhead from SSTOREs. Only SLOADs for config check.
+- **MAX duration choice (1 day)**: longer than typical memecoin attention span but allows extended fair-launch periods. Easily adjustable via constant if needed in v2.
 
 ## Parameter Mutability & Lifecycle Phases
 
@@ -1012,28 +1272,21 @@ Governance NFT is a **standard ERC-721**. The owner can:
 
 This makes the governance model **fluid** — projects can professionalize without redeploying the hook.
 
-### Multisig integration (optional v2 feature)
+### Multisig governance via NFT transfer (no delegation feature)
 
-For projects wanting upfront multisig governance without transferring NFT, the hook can support a designated manager per pool:
+Per **G6 decision: only NFT owner can call governance setters — always, no manager delegation feature even in v2.**
 
-```solidity
-function setManager(PoolId pid, address manager) external onlyGovernance(pid) {
-    campaigns[pid].config.manager = manager;
-    emit ManagerSet(pid, manager);
-}
+If a project wants multisig governance:
+- **At launch**: set `CampaignParams.lpRecipient = <Safe address>`. NFT minted directly to the Safe.
+- **Mid-launch**: deployer transfers governance NFT to the Safe via `PositionManager.transferFrom`. New owner inherits full governance.
 
-modifier onlyManagerOrGov(PoolId pid) {
-    CampaignState storage state = campaigns[pid];
-    if (state.config.manager != address(0) && msg.sender == state.config.manager) { _; return; }
-    require(
-        IERC721(POSITION_MANAGER).ownerOf(state.governanceTokenId) == msg.sender, 
-        "Not authorized"
-    );
-    _;
-}
-```
+This keeps the auth model **dead simple**: one address (or contract) owns the NFT, that address has governance. No additional delegation logic in the hook. Audit surface stays minimal.
 
-Setters then use `onlyManagerOrGov(pid)` instead of `onlyGovernance(pid)`.
+**Why no manager delegation:**
+- Adds storage + setter complexity to every module
+- Introduces "two paths to authority" — duplicate audit surface
+- ERC-721 transfer already provides the same composability (transfer to manager contract)
+- Stronger trust property: gov NFT owner = sole authority, no hidden delegated controllers
 
 ## Required Hook Permissions
 
