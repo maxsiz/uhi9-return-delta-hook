@@ -456,7 +456,6 @@ contract TokenLaunchHook is
     BuySellTaxMechanism,
     LiquidityLockMechanism,
     WhitelistPhaseMechanism,
-    SniperBlacklistMechanism,
     GovernanceModule
 {
     struct EnabledMechanisms {
@@ -464,7 +463,6 @@ contract TokenLaunchHook is
         bool tax;
         bool lock;
         bool whitelist;
-        bool sniperBlacklist;
         // future v2: bondingCurve, autoBuyback, treasuryRoute
     }
     
@@ -480,9 +478,6 @@ contract TokenLaunchHook is
         }
         if (en.antiSnipe) {
             require(_checkAntiSnipe(pid, tx.origin, _amount(params), _isBuy(params)), "Snipe");
-        }
-        if (en.sniperBlacklist) {
-            require(!_isSniperBlacklisted(pid, tx.origin), "Blacklisted");
         }
         
         uint24 fee = en.tax 
@@ -571,7 +566,6 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 | **M3** | `LiquidityLockMechanism` (incl. vesting) | `_beforeRemoveLiquidity` (revert) | **v1** | Mandatory (was M3+M4 merged) |
 | **M5** | `WhitelistPhaseMechanism` | `_beforeSwap` + `_beforeAddLiquidity` (revert) | **v1** | Optional per-launch |
 | **M12** | `InsiderRulesMechanism` (different tax/lock for whitelisted addresses) | `_beforeSwap` | **v1** | Optional |
-| **M13** | `SniperBlacklistMechanism` (block-0 buyer snapshot) | `_afterSwap` (track) + `_beforeSwap` (check) | **v1** | Optional, complements M1 |
 | **M8** | `TreasuryFeeRoutingMechanism` | `_afterSwap` + `afterSwapReturnDelta` | **v2** | Requires custom accounting; post-allowlist |
 | **M6** | `BondingCurveFallbackMechanism` | `_beforeSwap` + `beforeSwapReturnDelta` | **v2** | Complex math; post-allowlist |
 | **M7** | `AutoBuybackMechanism` | `_afterSwap` + atomic swap | **v2** | Defer to v2 |
@@ -584,6 +578,7 @@ Abstract inheritance is the **right level of modularity** for our problem: code 
 - ~~M9, M11~~ → deferred to v2 (M9 gas concerns, M11 cross-module design with M8)
 - ~~M14~~ → removed entirely (cumulative buy cap not pursued)
 - ~~M10~~ → removed entirely (anti-flip not pursued; transfer loophole and DCA penalty made v1 trade-offs unattractive)
+- ~~M13~~ → removed entirely (block-0 buyer blacklist not pursued; transfer loophole limited effectiveness, M1 + M2 deemed sufficient for sniper deterrence)
 
 ### Per-launch enable flags + presets
 
@@ -591,7 +586,7 @@ Custom UI can offer **presets** that pre-select sensible flag combinations:
 
 | Preset | Enabled mechanisms |
 |--------|--------------------|
-| **Memecoin** | M1 + M2 + M3 + M13 |
+| **Memecoin** | M1 + M2 + M3 |
 | **Fair Launch** | M1 + M2 + M3 |
 | **RWA / Permissioned** | M3 + M5 + M12 |
 | **DAO Token** | M2 + M3 |
@@ -620,7 +615,6 @@ Implementation note: `EnabledMechanisms` is set once at bootstrap (in `_beforeAd
 | `src/mechanisms/LiquidityLockMechanism.sol` | M3 — conditional + vesting unlock | v1 mandatory |
 | `src/mechanisms/WhitelistPhaseMechanism.sol` | M5 — phased KYC/allowlist access | v1 optional |
 | `src/mechanisms/InsiderRulesMechanism.sol` | M12 — separate rules for whitelisted insiders | v1 optional |
-| `src/mechanisms/SniperBlacklistMechanism.sol` | M13 — block-0 buyer blacklist | v1 optional |
 | `src/mechanisms/TreasuryFeeRoutingMechanism.sol` | M8 — fees to treasury via afterSwapReturnDelta | v2 (post-allowlist) |
 | `src/mechanisms/BondingCurveMechanism.sol` | M6 — fallback for thin-liquidity launches | v2 |
 | `src/mechanisms/AutoBuybackMechanism.sol` | M7 — atomic counter-buy on sell pressure | v2 |
@@ -1062,7 +1056,7 @@ The hook only checks **ownership** of the gov NFT — not who minted it. So tran
 
 ### Purpose
 
-Prevent sniper bots from grabbing huge portions of token supply in the first N seconds after launch by capping per-TX buy size during a configurable time window. Sells are unrestricted (sniper sell-side handled by M13 SniperBlacklist separately).
+Prevent sniper bots from grabbing huge portions of token supply in the first N seconds after launch by capping per-TX buy size during a configurable time window. Sells are unrestricted.
 
 ### Design decisions (A1-A10 locked)
 
@@ -1130,7 +1124,7 @@ abstract contract AntiSnipeMechanism {
         if (cfg.antiSnipeDuration == 0) return;
         if (block.timestamp >= launchTime + cfg.antiSnipeDuration) return;
         
-        // Sells unrestricted during anti-snipe window (M13 handles sniper sells)
+        // Sells unrestricted during anti-snipe window
         bool isBuy = (params.zeroForOne != tokenIsCurrency0);
         if (!isBuy) return;
         
@@ -2212,9 +2206,9 @@ Test against live Uniswap V4 PoolManager on Base.
 |-------|----------|-------------|
 | **Pre-coding research** | 1 week | ~~Verify salt convention~~ ✅; salt mining feasibility; Uniswap allowlist process |
 | **Architectural spec lock** | 1 week | Modular structure agreed; main hook skeleton + module template proven |
-| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5, M12, M13). Each: design doc + interface + open questions resolved |
+| **Per-mechanism specs** | 2-3 weeks | Iterative deep-dive on each v1 module (Governance, M1, M2, M3, M5, M12). Each: design doc + interface + open questions resolved |
 | **Mandatory modules** (M1-M3) + Governance + Wrapper | 5 weeks | Anti-snipe, tax, lock, governance NFT, atomic launch flow; 90% test coverage |
-| **Optional modules** (M5, M12, M13) | 3 weeks | Each module ~3-4 days incl. tests |
+| **Optional modules** (M5, M12) | 3 weeks | Each module ~3-4 days incl. tests |
 | **Token deployment** (TokenFactory + StandardToken) | 1 week | Cheap ERC-20 clones; integration with Wrapper |
 | **Web3 UI MVP** | 3 weeks | Static Vercel-hosted; campaign form with presets; wallet connect; deep links |
 | **Submit Uniswap allowlist application** | parallel | Submit ASAP after testnet artifact exists — covers full permission set (incl. `*ReturnDelta`); review typically 4-12 weeks |
@@ -2247,7 +2241,6 @@ Test against live Uniswap V4 PoolManager on Base.
    - **Whitelist (M5) + Anti-snipe (M1)**: order in `_beforeSwap`? Likely whitelist first (cheaper revert path).
    - **Insider rules (M12) + Tax (M2)**: does insider rule override the tax decay schedule for whitelisted addresses?
    - **Insider (M12) + Anti-snipe (M1)**: are insiders exempt from anti-snipe limits in block 0?
-   - **Sniper blacklist (M13) + Lock (M3)**: blacklisted seller can't sell but tries to remove liquidity — block via `_beforeRemoveLiquidity` too, or allow withdrawal of principal only?
 
 ### 🔵 v2 architectural decisions (post-v1)
 
