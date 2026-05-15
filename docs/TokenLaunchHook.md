@@ -661,125 +661,6 @@ Each mechanism file is a self-contained abstract contract following the [module 
 | `test/TokenFactory.t.sol` | Token deploy via clones, initialization correctness |
 | `test/TokenLaunchHook.fork.t.sol` | Mainnet fork tests against real PoolManager/PosM |
 
-## Mechanisms — Design Specs
-
-> **Status:** the specs below are the **initial draft** captured before the modular-architecture refactor. Each mechanism will be **re-spec'd individually** in upcoming sessions to:
-> - Lock down exact storage layout (`<Name>Config` / `<Name>State` structs)
-> - Decide v1 vs v2 placement (some may be deferred or merged)
-> - Define module interface (init, predicates, governance setters, events)
-> - Capture variants and open questions
->
-> See [Module catalog](#module-catalog-v1--planned-v2) for the current set with their v1/v2 designation. Refactor will follow the [Mechanism module template](#mechanism-module-template) shape.
-
-### M1: Anti-Snipe Block-Window
-
-**Goal:** Prevent sniper bots from buying entire supply in block 0.
-
-**Spec:**
-- `antiSnipeBlocks: uint32` — duration in blocks (default 10)
-- `maxBuyBpsPerBlock: uint16` — max % of supply purchasable per block by any address
-- `cooldownBlocks: uint8` — min blocks between TX from same address
-- Optional: snapshot block 0 buyers, blacklist them from selling for X blocks
-
-```solidity
-function _beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
-    internal override returns (bytes4, BeforeSwapDelta, uint24) 
-{
-    if (block.number < launchBlock + antiSnipeBlocks) {
-        require(_isBuy(params), "No sells during anti-snipe");
-        require(_buyAmount(params) <= maxBuyAbsolute, "Snipe attempt");
-        require(lastBuyBlock[tx.origin] + cooldownBlocks <= block.number, "Cooldown");
-        lastBuyBlock[tx.origin] = block.number;
-    }
-    // continue to tax logic...
-}
-```
-
-### M2: Buy/Sell Tax
-
-**Goal:** Asymmetric tax — discourage early sells, encourage buys.
-
-**Spec:**
-- `buyTaxBps: uint16` — initial buy tax (e.g., 100 = 1%)
-- `sellTaxBps: uint16` — initial sell tax (e.g., 500 = 5%)
-- `decayPeriod: uint32` — period over which tax decays to base rate
-- `baseTaxBps: uint16` — eventual minimum tax (e.g., 30 = 0.3%)
-
-```solidity
-function _beforeSwap(...) returns (bytes4, BeforeSwapDelta, uint24) {
-    uint24 dynamicFee;
-    uint256 elapsed = block.timestamp - launchTime;
-    
-    if (_isBuy(params)) {
-        dynamicFee = uint24(_decay(buyTaxBps, baseTaxBps, elapsed, decayPeriod));
-    } else {
-        dynamicFee = uint24(_decay(sellTaxBps, baseTaxBps, elapsed, decayPeriod));
-    }
-    return (this.beforeSwap.selector, BeforeSwapDelta.wrap(0), dynamicFee);
-}
-```
-
-**Tax distribution** (via `_afterSwap`):
-- 50% to LP holders proportional
-- 30% to project treasury
-- 20% to buyback & burn
-
-### M3: Liquidity Lock with Conditional Unlock
-
-**Goal:** Prevent rug pulls by locking LP until objective milestones met.
-
-**Spec — conditions:**
-- `unlockMode: enum { TIME_ONLY, VOLUME, HOLDERS, PRICE_FLOOR, COMBINED }`
-- `timeUnlock: uint256` — unix timestamp of guaranteed unlock
-- `volumeThreshold: uint256` — cumulative ETH volume required (e.g., 500 ETH)
-- `holderThreshold: uint32` — minimum unique holders (e.g., 1000)
-- `priceFloor: uint256` — minimum price; must hold for `priceFloorDays`
-
-Each condition trackable via hook callbacks:
-- Volume: increment in `_afterSwap`
-- Holders: bloom-filter approximate count (gas-friendly) or `Transfer` events
-- Price: read `slot0` periodically, track time-above-floor
-
-```solidity
-function tryUnlock() external {
-    require(_conditionsMet(), "Conditions not met");
-    LP_NFT.transferFrom(address(this), projectOwner, lockedTokenId);
-    emit Unlocked(block.timestamp, projectOwner);
-}
-```
-
-### M4: Whitelist Phases
-
-**Goal:** KYC'd early access, then progressive opening.
-
-**Spec:**
-- Phase 1 (0-7 days): Only whitelist; max buy = X
-- Phase 2 (7-30 days): Open buy, max sell = Y/day per address
-- Phase 3 (30+): Fully open
-
-Whitelist source: external contract (e.g., Verax attestation, Sismo, simple Merkle root).
-
-### M5: Bonding Curve Fallback
-
-**Goal:** Handle launches with thin initial liquidity gracefully.
-
-**Spec:**
-- If pool liquidity < `minLiquidity`, swap routed through bonding curve in hook
-- Bonding curve formula: `priceN = basePrice * (1 + supplyN / supplyTotal)^exponent`
-- Reserves from sells go to LP, increasing liquidity over time
-
-Implemented via `BeforeSwapDelta` adjustments in `_beforeSwap`.
-
-### M6: Sell-Pressure Auto-Buyback (advanced)
-
-**Goal:** Automatic price support during sell-offs.
-
-**Spec:**
-- Hook tracks sell volume in recent window
-- If sell pressure > threshold, hook taps treasury reserves
-- Atomic buyback inside the sell TX (counter-buy)
-- Stabilizes price during panic dumps
-
 ## GovernanceModule — Finalized Spec
 
 ### Purpose
@@ -2137,42 +2018,24 @@ Either outcome — **product works**. Allowlist is a nice-to-have, not load-bear
 
 ### Phase 1: Local Forge tests
 ```bash
-forge test --match-path ./test/TokenLaunchHook*.t.sol -vv
+forge test --match-path ./test/**/*.t.sol -vv
 ```
 
-**Factory & proxy tests:**
-- `test_factory_deploysProxyWithCorrectFlagBits` — clone'd address has expected permission bits
-- `test_factory_atomicCloneAndSetup_noRaceWindow` — `setupLaunch` cannot be called by anyone else
-- `test_factory_setupLaunchTwice_reverts` — double-init protection works
-- `test_proxy_delegatecallReadsCorrectState` — storage isolation between proxies
-- `test_proxy_immutablePoolManagerReadsFromImpl` — `poolManager` consistent across proxies
+Tests are organized per module — each Finalized Spec section above lists its own test cases:
 
-**Mechanism tests:**
-- `test_antiSnipe_largeBuy_reverts` — block 0 buy > limit reverts
-- `test_antiSnipe_cooldown_reverts` — same address two TX same block reverts
-- `test_antiSnipe_passesAfterWindow` — after N blocks restrictions lift
-- `test_tax_buyAndSell_correctRates` — verify asymmetric tax applied
-- `test_tax_decay_overTime` — tax decreases per schedule
-- `test_taxDistribution_correctSplits` — 50/30/20 verified
-- `test_liquidityLock_timeOnly_unlocks` — time-based unlock works
-- `test_liquidityLock_volumeCondition_unlocks` — volume-based unlock
-- `test_liquidityLock_combined_unlocks` — combined conditions
-- `test_whitelist_phase1_restricts` — non-whitelisted reverts in phase 1
-- `test_bondingCurve_lowLiquidity_routes` — fallback activates
-- `test_buybackTrigger_sellPressure` — auto-buyback fires correctly
+| Test file | Module | Tests |
+|-----------|--------|-------|
+| `test/mechanisms/GovernanceModule.t.sol` | Governance | 15 |
+| `test/mechanisms/AntiSnipeMechanism.t.sol` | M1 | 8 |
+| `test/mechanisms/BuySellTaxMechanism.t.sol` | M2 | 14 |
+| `test/mechanisms/LiquidityLockMechanism.t.sol` | M3 | 20 |
+| `test/mechanisms/WhitelistPhaseMechanism.t.sol` | M5 | 19 |
+| `test/CampaignWrapper.t.sol` | Wrapper integration | atomic flow, edge cases |
+| `test/TokenLaunchHook.integration.t.sol` | End-to-end | multi-module interaction |
+| `test/TokenLaunchHook.race.t.sol` | Anti-sandwich | front-run resistance |
+| `test/TokenFactory.t.sol` | TokenFactory | clone deploy + init |
 
-**Governance tests:**
-- `test_governance_capturedOnFirstAddLiquidity` — first LP's NFT becomes gov
-- `test_governance_wrongFirstLP_reverts` — sniper bot can't capture
-- `test_governance_setBuyTax_byOwner_succeeds` — NFT owner can adjust
-- `test_governance_setBuyTax_byNonOwner_reverts` — others cannot
-- `test_governance_setBuyTax_increaseRejected` — monotone constraint
-- `test_governance_extendUnlock_succeeds` — extension allowed
-- `test_governance_shortenUnlock_reverts` — shortening forbidden
-- `test_governance_NFT_transferGivesNewOwnerControl` — transferability works
-- `test_governance_NFT_burnDuringLaunch_reverts` — Phase 1 burn-block
-- `test_governance_NFT_burnAfterLaunch_succeeds` — Phase 2 unblocks burn
-- `test_governance_postLaunchEnd_settersRevert` — frozen Phase 2
+**Total v1 mechanism unit tests: ~76** (excluding wrapper / integration / race tests).
 
 ### Phase 2: Mainnet fork tests
 ```bash
