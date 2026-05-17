@@ -94,6 +94,38 @@ Wallet implements `IUnlockCallback` and calls `poolManager.unlock(...)` directly
 
 **Direct wins clearly for this use case.** PosM features add gas + complexity without benefit.
 
+## Pool Selection & Validation
+
+`openPosition` consumes a full `PoolKey` (`currency0, currency1, fee, tickSpacing, hooks`). The operator typically starts from just two token addresses — many V4 pools can exist for the same pair (different fee tier, tickSpacing, and especially different hook addresses). The wallet does **not** discover pools on-chain. V4 `PoolManager` has no enumeration: `PoolId = keccak256(abi.encode(PoolKey))` is a one-way hash and the manager only stores `PoolId → state`. Reverse lookup is impossible without an external index.
+
+**Responsibility split:** discovery lives off-chain (operator / bot), validation lives on-chain (this contract).
+
+### Off-chain discovery (operator / bot)
+
+Recommended path, in order:
+
+1. **Primary — Uniswap Trading API `/quote`** (`https://trade-api.gateway.uniswap.org/v1`). Send a small test quote constrained to V4; the router replies with the `PoolKey` of the deepest pool it would route through. This is the cheapest signal for "best pool by liquidity".
+   - Headers: `Content-Type: application/json`, `x-api-key: <UNISWAP_API_KEY>`, `x-universal-router-version: 2.0`.
+   - Payload essentials: `tokenIn`, `tokenOut`, `amount` (small probe), `type: "EXACT_INPUT"`, `protocols: ["V4"]`, `hookOptions: "V4_HOOKS_INCLUSIVE"` (or `V4_NO_HOOKS` to force hookless pools only), `tokenInChainId` / `tokenOutChainId` from supported set (1, 8453, 42161, 10, 137, 130).
+   - Parse: the chosen V4 route's pool descriptor → `currency0, currency1, fee, tickSpacing, hooks`. Re-canonicalize token order (`currency0 < currency1`) before forming the on-chain call.
+2. **Fallback — V4 Subgraph** (TheGraph). GraphQL list of all pools for the pair with `liquidity`, `volumeUSD`, `fee`, `tickSpacing`, `hooks`. Use when Trading API is unavailable or when the operator wants to audit candidates manually (e.g., second-deepest pool with better fee tier).
+3. **Future — self-indexed `Initialize` events.** Out of scope for v1; documented as the autonomy path if dependence on external APIs becomes unacceptable.
+
+Before submitting `openPosition`, the operator should also cross-check `PoolKey.hooks` against the [`Uniswap/hooklist`](https://github.com/Uniswap/hooklist) GitHub JSON registry. This is an off-chain courtesy duplicate of the on-chain check below.
+
+### On-chain validation (this contract)
+
+`openPosition` validates the provided `PoolKey` before any `modifyLiquidity` call:
+
+1. **Hook whitelist (hybrid).** Hooks with `beforeSwapReturnDelta` / `afterSwapReturnDelta` can break LP economics — async swaps, custom curves, fee-stealing — so opening a tactical LP into an unknown hook is unacceptable.
+   - Local mapping `allowedHooks[address]` managed by the NFT owner via `setHookAllowed`. Constructor seeds `allowedHooks[address(0)] = true` (standard hookless pools).
+   - Optional external `hookRegistry` (an `IHookRegistry` view contract) for delegating policy to an on-chain source. If non-zero, the registry must also approve the hook. As of 2026-05 `Uniswap/hooklist` is GitHub-only with no canonical on-chain mirror — interface is reserved but `hookRegistry` stays `address(0)` until such a contract exists.
+   - Require: `allowedHooks[key.hooks] && (hookRegistry == address(0) || IHookRegistry(hookRegistry).isAllowed(key.hooks))`.
+2. **Pool initialized.** `StateLibrary.getSlot0(key.toId()).sqrtPriceX96 != 0`. Catches operator typos in `tickSpacing` / `fee` / `hooks` that would otherwise resolve to a phantom `PoolId` and silently open a position no swap will ever touch.
+3. **Minimum pool liquidity (optional).** `openPosition` accepts a `uint128 minPoolLiquidity` parameter (default `0`); if non-zero, require `StateLibrary.getLiquidity(key.toId()) >= minPoolLiquidity`. Lets the bot refuse "empty" pools.
+
+On-chain brute-force discovery (probing common `(fee, tickSpacing, address(0))` combinations via `getSlot0`) is **explicitly out of scope** — gas and complexity not justified for coverage of the hookless subset only.
+
 ## Architecture Overview
 
 ```
@@ -107,7 +139,9 @@ Capital management:
   - Owner (only) withdraws via withdrawERC20 / withdrawNative
 
 Open position (called by NFT owner or operator):
-  - openPosition(poolKey, tickLower, tickUpper, liquidity, salt)
+  - openPosition(poolKey, tickLower, tickUpper, liquidity, salt, minPoolLiquidity)
+    → validate: allowedHooks + optional hookRegistry + getSlot0(poolId) != 0
+                 + (if minPoolLiquidity > 0) getLiquidity(poolId) >= minPoolLiquidity
     → poolManager.unlock(OPEN, ...)
     → callback: modifyLiquidity(+L) → BalanceDelta < 0 (we owe)
     → _settleDelta — pay from wallet balance
@@ -154,6 +188,10 @@ contract JITLPWallet is ERC721, IUnlockCallback {
     
     mapping(address => bool) public operators;
     
+    // ─── Hook policy (see "Pool Selection & Validation") ───
+    mapping(address => bool) public allowedHooks;  // local whitelist
+    address public hookRegistry;                   // optional IHookRegistry; 0 disables
+    
     // ─── Capital management ───
     receive() external payable;  // anyone can deposit native
     function depositERC20(address token, uint256 amount) external;  // anyone can deposit
@@ -166,7 +204,8 @@ contract JITLPWallet is ERC721, IUnlockCallback {
         int24 tickLower,
         int24 tickUpper,
         uint128 liquidity,
-        bytes32 salt
+        bytes32 salt,
+        uint128 minPoolLiquidity  // 0 disables the liquidity-floor check
     ) external onlyAuthorized;
     
     function closePosition(bytes32 salt) external onlyAuthorized;
@@ -177,6 +216,10 @@ contract JITLPWallet is ERC721, IUnlockCallback {
     
     // ─── Delegation ───
     function setOperator(address op, bool allowed) external onlyOwnerNFT;
+    
+    // ─── Hook policy ───
+    function setHookAllowed(address hook, bool allowed) external onlyOwnerNFT;
+    function setHookRegistry(address registry) external onlyOwnerNFT;
     
     // ─── ERC-721 hardening ───
     // Override _update / _mint to prevent additional tokenIds
@@ -191,6 +234,20 @@ contract JITLPWallet is ERC721, IUnlockCallback {
     function ownerNFTHolder() external view returns (address) {
         return ownerOf(OWNERSHIP_TOKEN_ID);
     }
+}
+
+interface IHookRegistry {
+    function isAllowed(address hook) external view returns (bool);
+}
+```
+
+Constructor seeds the hook whitelist with the hookless slot:
+
+```solidity
+constructor(address initialOwner, IPoolManager poolManager_) ERC721(...) {
+    POOL_MANAGER = poolManager_;
+    allowedHooks[address(0)] = true;
+    _mint(initialOwner, OWNERSHIP_TOKEN_ID);
 }
 ```
 
@@ -282,6 +339,13 @@ Transferring the ownership NFT (`safeTransferFrom`) atomically transfers all wal
 10. **Single owner NFT vs multiple NFTs in collection?**
     - Singleton — exactly one token. New "wallet" = new contract deploy.
 
+11. **Pool selection — on-chain or off-chain?**
+    - **Decision: off-chain discovery + on-chain validation.** Operator/bot picks `PoolKey` via Trading API `/quote` (primary) or V4 Subgraph (fallback). Contract validates the supplied key against `allowedHooks` / `hookRegistry` and asserts the pool is initialized.
+    - On-chain brute-force probing of fee/tickSpacing combinations is out of scope — covers only the hookless subset and adds gas for no real win.
+
+12. **Hook whitelist policy?**
+    - **Decision: local `allowedHooks` mapping + optional external `hookRegistry`.** Default seeds `address(0)` only (standard hookless pools). Owner adds vetted hooks per use case. `hookRegistry` is `address(0)` initially; reserved for a future on-chain mirror of `Uniswap/hooklist` or a custom registry.
+
 ## Verification Plan
 
 ### Phase 1: Local Forge tests
@@ -303,6 +367,14 @@ Test cases:
 - `test_openPosition_byNonAuthorized_reverts`
 - `test_openPosition_saltCollision_reverts`
 - `test_openPosition_insufficientBalance_reverts`
+- `test_openPosition_disallowedHook_reverts`
+- `test_openPosition_allowedHook_succeeds`
+- `test_openPosition_uninitializedPool_reverts`
+- `test_openPosition_belowMinLiquidity_reverts`
+- `test_setHookAllowed_byOwner_succeeds`
+- `test_setHookAllowed_byNonOwner_reverts`
+- `test_setHookRegistry_blocksWhenRegistryRejects`
+- `test_hookRegistryZero_fallsBackToLocalWhitelist`
 - `test_closePosition_byNFTOwner_succeeds_returnsCapitalPlusFees`
 - `test_decreasePosition_partial_succeeds`
 - `test_pokePosition_collectsFeesOnly`
@@ -336,6 +408,8 @@ forge test --fork-url $BASE_RPC --match-path ./test/JITLPWallet.fork.t.sol
 | Singleton NFT mint loophole | 🔴 High | Override `_mint` to forbid post-constructor minting; tests verify |
 | Direct PoolManager flash-accounting bug | 🟡 Medium | Reuse battle-tested settle/take patterns from `SelfLPDirect` |
 | ERC-721 transfer reentrancy via `onERC721Received` | 🟡 Medium | Use `nonReentrant` modifier on capital ops; standard OZ guard |
+| Operator opens position in pool with malicious hook → LP economics broken (async swaps, custom curve, fee-stealing) | 🔴 High | `allowedHooks` whitelist + optional `hookRegistry` validated in `openPosition`; default whitelist is `{address(0)}` |
+| Operator typo in `PoolKey` → position opens in phantom uninitialized pool | 🟡 Medium | `openPosition` requires `StateLibrary.getSlot0(poolId).sqrtPriceX96 != 0` |
 
 ## Out of Scope (v1)
 
